@@ -1,0 +1,4 @@
+# 微信桥依赖
+qrcode
+pillow
+pycryptodome

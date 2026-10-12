@@ -1,0 +1,9 @@
+# 运行数据：凭据、消息、游标、日志、媒体、对话记录，一律不进仓库
+state/
+inbox/
+outbox/
+media/
+history.jsonl
+__pycache__/
+*.pyc
+.venv/
