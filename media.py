@@ -220,7 +220,7 @@ def download_message_attachments(session, msg, directory, prefix):
 def _validate_silk_header(header, size):
     prefix = next((p for p in SILK_HEADERS if header.startswith(p)), None)
     if prefix is None or size <= len(prefix) + (1 if header[len(prefix):len(prefix) + 1] == b"\n" else 0):
-        raise ValueError("send-voice requires SILK V3 audio; transcode MP3/WAV externally or use send-file")
+        raise ValueError("Invalid SILK V3 audio; pass the original .mp3 to send-voice for automatic conversion")
 
 
 def validate_silk_file(path):
@@ -241,17 +241,25 @@ def validate_media_spec(spec, check_file=False):
     if not isinstance(spec.get("path"), str) or not spec["path"]:
         raise ValueError("media path is required")
     if spec["kind"] == "voice":
-        encoding = spec.get("encode_type")
+        encoding = spec.get("encode_type", 6)
         if type(encoding) is not int or encoding not in VOICE_EXTENSIONS:
-            raise ValueError("send-voice only supports SILK (encode_type=6); use send-file for MP3/WAV")
+            raise ValueError("outgoing voice uses SILK (encode_type=6); omit encode_type for automatic MP3 conversion")
+        extension = os.path.splitext(spec["path"])[1].lower()
+        if extension == ".mp3":
+            if check_file:
+                if not os.path.isfile(spec["path"]):
+                    raise ValueError("MP3 source file does not exist")
+                if not 0 < os.path.getsize(spec["path"]) <= MAX_MEDIA_BYTES:
+                    raise ValueError("MP3 source must be nonempty and no larger than 25 MiB")
+            return  # The sending worker derives all output metadata from decoded audio.
         for field in ("sample_rate", "playtime"):
             if type(spec.get(field)) is not int or spec[field] <= 0:
                 raise ValueError("voice %s must be a positive integer" % field)
         bits = spec.get("bits_per_sample")
         if bits is not None and (type(bits) is not int or not 1 <= bits <= 64):
             raise ValueError("voice bits_per_sample must be an integer from 1 to 64")
-        if os.path.splitext(spec["path"])[1].lower() not in VOICE_EXTENSIONS[encoding]:
-            raise ValueError("voice file extension does not match encode_type; transcode first")
+        if extension not in VOICE_EXTENSIONS[encoding]:
+            raise ValueError("voice input must be MP3 or SILK V3")
         if check_file:
             validate_silk_file(spec["path"])
     if spec["kind"] == "video" and os.path.splitext(spec["path"])[1].lower() != ".mp4":
@@ -299,6 +307,10 @@ def upload_media(api_post, session, to_user_id, file_path, kind, options=None):
     """
     spec = dict(options or {}, kind=kind, path=file_path)
     validate_media_spec(spec)
+    if kind == "voice" and os.path.splitext(file_path)[1].lower() == ".mp3":
+        raise ValueError("MP3 must be converted before upload; use bridge.py send-voice")
+    if kind == "voice":
+        spec["encode_type"] = 6
     if not os.path.isfile(file_path):
         raise ValueError("not a file: %s" % file_path)
     size = os.path.getsize(file_path)

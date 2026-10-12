@@ -2,3 +2,6 @@
 qrcode
 pillow
 pycryptodome
+# SILK encoder binding (do not install the unrelated package named pysilk).
+silk-python==0.2.8
+imageio-ffmpeg>=0.5.1,<0.7

@@ -18,7 +18,7 @@ Subcommands:
   send-file   发送本地文件（需先有对方消息的 context）
   send-image  发送本地图片（需先有对方消息的 context）
   send-video  发送本地 MP4 视频（需先有对方消息的 context）
-  send-voice  发送本地已编码语音（实验性，须指定编码/采样率/时长）
+  send-voice  发送 MP3（自动转 SILK）或本地 SILK 语音（实验性）
   mark        标记 inbox 消息状态（供执行者用）
   cleanup     清理 N 天前的收发记录与媒体（默认 30 天）
   serve       前台轮询循环（调试用；生产由 cron tick 驱动）
@@ -44,6 +44,7 @@ import uuid
 
 import media as media_mod
 import session_store
+import voice_codec
 from runtime_io import atomic_write_json, atomic_write_text, private_directory, private_file
 
 if os.name == "nt":
@@ -880,6 +881,12 @@ def _send_locked(args):
                     raise RuntimeError("PAUSED_1H")
                 if part["kind"] == "media" and o["media"]["kind"] == "voice":
                     media_mod.validate_media_spec(o["media"])
+                    if (part["item_list"] is None
+                            and os.path.splitext(o["media"]["path"])[1].lower() == ".mp3"):
+                        o["media"] = voice_codec.prepare_mp3(
+                            o["media"]["path"], os.path.join(ROOT, "media", "voice-cache"))
+                        # Persist conversion before uploading so retries use the same SILK.
+                        _write_outbox(p, o)
                     # Older pending uploads may already contain an unplayable MP3 item.
                     if part["item_list"] is not None:
                         if any(item.get("type") != 3 or
@@ -973,7 +980,7 @@ def outbox_path(key):
 
 
 def queue_reply(reply_to, to_user_id, context_token, text, media=None):
-    """Queue image/file/video/voice; voice specs require encode_type/sample_rate/playtime."""
+    """Queue image/file/video/voice. MP3 voice is converted automatically when sending."""
     with Locked() as ok:
         if not ok:
             raise RuntimeError("bridge busy; retry queue_reply later")
@@ -1293,12 +1300,12 @@ def main():
     video.add_argument("path")
     video.add_argument("--text", default="")
 
-    voice = sub.add_parser("send-voice", help="experimental: queue SILK V3 audio (no transcoding)")
+    voice = sub.add_parser("send-voice", help="experimental: queue MP3 (auto SILK) or SILK V3 audio")
     voice.add_argument("path")
     voice.add_argument("--text", default="")
     voice.add_argument("--encode-type", type=int, choices=[6], default=6, help="SILK only (default: 6)")
-    voice.add_argument("--sample-rate", type=int, required=True, help="Hz")
-    voice.add_argument("--playtime", type=int, required=True, help="duration in milliseconds")
+    voice.add_argument("--sample-rate", type=int, default=None, help="Hz; required for SILK, automatic for MP3")
+    voice.add_argument("--playtime", type=int, default=None, help="milliseconds; required for SILK, automatic for MP3")
     voice.add_argument("--bits-per-sample", type=int, default=None, help="optional source bit depth")
 
     cc = sub.add_parser("cleanup")

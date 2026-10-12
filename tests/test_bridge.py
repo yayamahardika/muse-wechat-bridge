@@ -17,6 +17,7 @@ import bridge
 import media
 import runtime_io
 import session_store
+import voice_codec
 
 
 class Response(io.BytesIO):
@@ -446,6 +447,72 @@ class BridgeTests(unittest.TestCase):
             bridge.cmd_send(self.args)
             api.assert_not_called()
         self.assertIn("SILK", self.read_reply("legacy-voice")["last_error"])
+
+    def test_mp3_voice_is_converted_once_before_upload_and_reused_after_timeout(self):
+        source, encoded = Path(self.temp.name, "reply.mp3"), Path(self.temp.name, "reply.silk")
+        source.write_bytes(b"ID3test")
+        encoded.write_bytes(b"\x02#!SILK_V3\x03\x00abc")
+        self.queue(media_spec={"kind": "voice", "path": str(source)})
+        prepared = {"kind": "voice", "path": str(encoded), "source_path": str(source),
+                    "encode_type": 6, "sample_rate": 24000, "playtime": 20, "bits_per_sample": 16}
+        uploaded = {"type": 3, "voice_item": {"encode_type": 6, "sample_rate": 24000, "playtime": 20}}
+        with patch.object(voice_codec, "prepare_mp3", return_value=prepared) as convert, \
+                patch.object(media, "upload_media", return_value=uploaded) as upload, \
+                patch.object(bridge, "http_post", side_effect=[
+                    (None, "timeout"), ({"ret": 0}, None), ({"ret": 0}, None)]) as post:
+            bridge.cmd_send(self.args)
+            self.assertEqual(self.read_reply()["media"]["path"], str(encoded))
+            source.unlink()
+            encoded.unlink()  # Uploaded bytes and client ID are already durably cached.
+            bridge.cmd_send(self.args)
+            convert.assert_called_once()
+            upload.assert_called_once()
+            self.assertEqual(upload.call_args.args[3], str(encoded))
+            self.assertEqual(upload.call_args.kwargs["options"]["playtime"], 20)
+            self.assertEqual(post.call_args_list[0].args[2]["msg"]["client_id"],
+                             post.call_args_list[1].args[2]["msg"]["client_id"])
+        self.assertEqual(self.read_reply()["status"], "sent")
+
+    def test_failed_mp3_conversion_does_not_upload_or_send(self):
+        source = Path(self.temp.name, "reply.mp3")
+        source.write_bytes(b"ID3test")
+        self.queue(media_spec={"kind": "voice", "path": str(source)})
+        with patch.object(voice_codec, "prepare_mp3", side_effect=voice_codec.VoiceConversionError("decode failed")), \
+                patch.object(media, "upload_media") as upload, patch.object(bridge, "http_post") as post:
+            bridge.cmd_send(self.args)
+            upload.assert_not_called()
+            post.assert_not_called()
+        self.assertEqual(self.read_reply()["status"], "pending")
+        self.assertEqual(self.read_reply()["media"]["path"], str(source))
+        self.assertIn("decode failed", self.read_reply()["last_error"])
+
+    def test_transcoded_path_is_durable_even_when_upload_fails(self):
+        source, encoded = Path(self.temp.name, "reply.mp3"), Path(self.temp.name, "reply.silk")
+        source.write_bytes(b"ID3test")
+        encoded.write_bytes(b"\x02#!SILK_V3\x03\x00abc")
+        self.queue(media_spec={"kind": "voice", "path": str(source)})
+        prepared = {"kind": "voice", "path": str(encoded), "encode_type": 6,
+                    "sample_rate": 24000, "playtime": 20}
+        with patch.object(voice_codec, "prepare_mp3", return_value=prepared) as convert, \
+                patch.object(media, "upload_media", side_effect=[
+                    RuntimeError("upload failed"), {"type": 3, "voice_item": {"encode_type": 6}}]) as upload, \
+                patch.object(bridge, "http_post", return_value=({"ret": 0}, None)):
+            bridge.cmd_send(self.args)
+            self.assertEqual(self.read_reply()["media"]["path"], str(encoded))
+            source.unlink()
+            bridge.cmd_send(self.args)
+            convert.assert_called_once()
+            self.assertEqual(upload.call_count, 2)
+        self.assertEqual(self.read_reply()["status"], "sent")
+
+    def test_mp3_voice_cli_needs_no_sampling_or_duration_arguments(self):
+        with patch.object(sys, "argv", ["bridge.py", "send-voice", "reply.mp3"]), \
+                patch.object(bridge, "cmd_send_media", return_value=0) as send:
+            self.assertEqual(bridge.main(), 0)
+        args = send.call_args.args[0]
+        self.assertEqual(args.kind, "voice")
+        self.assertIsNone(args.sample_rate)
+        self.assertIsNone(args.playtime)
 
     def test_video_and_voice_send_retries_reuse_upload_and_client_id(self):
         for kind, ext, item_type, options in [

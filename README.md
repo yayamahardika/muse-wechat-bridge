@@ -7,7 +7,7 @@
 ## 功能与边界
 
 - 仅接收本次扫码绑定用户的私聊，过滤群聊及其他用户消息。
-- 接收文字，以及图片、文件、语音、视频附件；支持发送文字、图片、文件、MP4 视频及实验性 SILK 语音消息。
+- 接收文字，以及图片、文件、语音、视频附件；支持发送文字、图片、文件、MP4 视频及实验性 SILK 语音消息，MP3 输入自动转 SILK。
 - 接收语音时，将微信后端提供的 `voice_item.text` 转写文本写入 inbox 的 `text`，供执行者按文字任务处理，同时保留语音附件下载流程；该接收链路已获用户真机实测反馈。
 - 提取引用消息的文字、语音转写及附件，单独写入 `references`；保留引用摘要、服务端消息 ID 和局部引用信息，最多展开三层。只有 ID 的引用按精确 ID 查找同账号、同聊天对象的本地记录，未命中时明确标记缺失。
 - 附件保留文件原名、大小、语音编码/采样率/时长等元数据，并独立下载图片和视频的缩略图。
@@ -81,7 +81,11 @@ python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements.txt
 ```
 
-依赖包括 `qrcode`、`pillow` 和 `pycryptodome`。后文统一使用 `python` 表示已安装依赖的解释器；未激活虚拟环境时，请替换为上面的虚拟环境解释器路径。
+依赖包括 `qrcode`、`pillow`、`pycryptodome`，以及语音转换所需的 `silk-python`、`imageio-ffmpeg`。升级已有部署后也须重新运行 `python -m pip install -r requirements.txt`。安装名为 `silk-python`，导入名为 `pysilk`；不要安装 PyPI 上另一个名为 `pysilk` 的包。
+
+MP3 转码优先使用 `IMAGEIO_FFMPEG_EXE` 指定的可执行文件，其次使用 PATH 中的 FFmpeg，否则使用 `imageio-ffmpeg` 随 wheel 分发的 FFmpeg。常见 Windows/macOS/Linux 平台无需自行编译 SILK 编码器；其他平台若缺少 wheel，须先配置相应编译环境或使用支持的 Python/平台。
+
+后文统一使用 `python` 表示已安装依赖的解释器；未激活虚拟环境时，请替换为上面的虚拟环境解释器路径。
 
 运行账户需要具备设置运行目录和文件权限的能力；Windows 使用当前用户与 SYSTEM 的专用 ACL。
 
@@ -131,16 +135,29 @@ python bridge.py send --typing
 
 将示例路径替换为实际文件路径。**`send-image`、`send-file`、`send-video` 和 `send-voice` 只将消息加入队列，`send` 才执行发送**；`--text` 为可选说明文字，`--typing` 用于在发送期间显示正在输入状态。
 
-语音发送为实验性能力，**当前仅接受 SILK V3 输入（编码 6，扩展名 `.silk` / `.sil`）**。需要外部 TTS/编码工具先生成 SILK 文件，当前没有内置 MP3→SILK 转码器。下面以实际采样率为 24000 Hz、时长为 1500 毫秒的 SILK 为例，参数必须按真实音频调整：
+语音发送为实验性能力。bot/TTS 生成 MP3 后可直接入队，`send` 自动完成 **MP3→单声道 16 位 PCM→腾讯格式 SILK V3**，并自动计算输出时长：
+
+```sh
+python bridge.py send-voice "path/to/reply.mp3"
+python bridge.py send --typing
+```
+
+MP3 输入无需填写编码、采样率、位深或时长；这些参数以实际转换结果为准（输出固定为编码 6、24 kHz、16 位单声道，保留末尾不足 20 毫秒的音频并补零）。原 MP3 保留，最终上传的是 SILK，不会把 MP3 字节放入语音气泡。
+
+已有 SILK 文件仍可直接发送。下面以真实采样率为 24000 Hz、时长为 1500 毫秒的 SILK 为例，参数必须按实际音频调整：
 
 ```sh
 python bridge.py send-voice "path/to/reply.silk" --sample-rate 24000 --playtime 1500
 python bridge.py send --typing
 ```
 
-`--encode-type` 默认且仅允许 6；采样率、时长须为正整数，位深可选。入队及上传前检查实际文件头 `#!SILK_V3`（也接受前置字节 `0x02`），拒绝仅改扩展名的 MP3 和空文件；签名检查不等于完整解码验证。MP3/WAV 可通过 `send-file` 作为普通附件发送。
+`--encode-type` 默认且仅允许 6，表示最终发出的 SILK 编码。SILK 输入须提供正数采样率和时长，位深可选；输入扩展名为 `.silk` / `.sil`，入队及上传前检查实际文件头，拒绝仅改扩展名的 MP3。自动转换输出带腾讯格式的 `0x02` 前缀，检查完整帧边界、时长和文件摘要。
 
-用户真机反馈：MP3 作为语音消息时，服务端返回成功但微信客户端没有渲染；入站语音文件头为 SILK。因此本项目不再根据协议中的 MP3 枚举宣称语音气泡可播放。**SILK 出站播放和视频发送仍需真机验证；outbox 的 `sent` 只表示发送请求被服务端接受，不证明客户端已展示或播放。**
+MP3 转码使用独立子进程，最多运行 30 秒。原文件上限 25 MiB，**本项目将单条自动转码语音限制为 60 秒**；超过时拒绝并提示拆分，不会静默截断。这是桥接的本地限制，不是对服务端上限的保证。解码器仅读取本地 MP3，转码失败时记录错误并保留待发任务，不上传原 MP3，也不自动改成文件发送。WAV 等格式目前请先转成 MP3，或用 `send-file` 作为普通附件发送。
+
+转换结果和元数据缓存于 `media/voice-cache/`，缓存键包含原内容和转换参数。转换后的路径和实际语音参数会在上传前原子写回 outbox；网络重试复用转换结果、已缓存的上传结果和客户端 ID。原生 SILK 输入的签名检查不等于完整解码验证。
+
+用户真机反馈：直接把 MP3 作为语音消息时，服务端返回成功但微信客户端没有渲染；入站语音文件头为 SILK。本次自动转码已完成真实 MP3 解码、腾讯格式 SILK 编码及 SILK 回解验证。**自动转码后微信端的播放和视频发送仍需真机验证；outbox 的 `sent` 只表示发送请求被服务端接受，不证明客户端已展示或播放。**
 
 ### 接收内容字段
 
@@ -207,8 +224,7 @@ bridge.queue_reply(
     to_user_id=record["from_user_id"],
     context_token=record["context_token"],
     text="",  # 可附加说明文字
-    media={"kind": "voice", "path": "/absolute/path/reply.silk",
-           "encode_type": 6, "sample_rate": 24000, "playtime": 1500},
+    media={"kind": "voice", "path": "/absolute/path/reply.mp3"},
 )
 ```
 
@@ -261,8 +277,9 @@ inbox 记录里的 local_time 字段已经是北京时间（如 "2026-10-12 07:5
       （注意：是 from_user_id，不是 to_user_id），context_token 取 inbox 记录的
       context_token；需要交付文件 / 图片 / MP4 视频时传入
       media={"kind": "image"|"file"|"video", "path": "/绝对路径"}（25MB 以内）。
-      语音回复须先生成 SILK V3 音频，使用 kind="voice"、encode_type=6，并提供真实的
-      sample_rate、playtime；不要猜参数或把 MP3 塞进语音气泡。微信回复简洁，
+      语音回复可先由 TTS 生成 MP3，再传入 media={"kind":"voice","path":"/绝对路径/reply.mp3"}，
+      send 会自动转成 SILK 并计算采样率/时长，无需猜参数；单条 MP3 语音不超过 60 秒。
+      已有 SILK 输入则须提供真实的 encode_type=6、sample_rate、playtime。微信回复简洁，
       默认不超 500 字，不刷屏。
    f. `python bridge.py mark <key> done`；失败则 mark failed 并在 note 写清原因。
    g. 再执行一次 `python bridge.py send --typing`，把本轮回复发出去。
@@ -299,7 +316,7 @@ inbox 记录里的 local_time 字段已经是北京时间（如 "2026-10-12 07:5
 | `send-file <path>` | 将本地文件加入发送队列 | `--text TEXT` |
 | `send-image <path>` | 将本地图片加入发送队列 | `--text TEXT` |
 | `send-video <path>` | 将本地 MP4 视频加入发送队列 | `--text TEXT` |
-| `send-voice <path>` | 将 SILK V3 音频加入队列（实验性，不转码） | 必填 `--sample-rate HZ`、`--playtime MS`；可选 `--encode-type 6`（默认 6）、`--text TEXT`、`--bits-per-sample BITS` |
+| `send-voice <path>` | 将 MP3（发送时自动转 SILK）或 SILK V3 加入队列（实验性） | MP3 无需语音参数；SILK 必填 `--sample-rate HZ`、`--playtime MS`；可选 `--encode-type 6`、`--text TEXT`、`--bits-per-sample BITS` |
 | `send-proactive <text>` | 使用最近接收消息的上下文，将文字加入发送队列 | `--kind general`、`--cooldown 3600`（秒） |
 | `mark <key> <status>` | 标记 inbox 消息状态 | `--note TEXT`；状态为 `new`、`processing`、`done` 或 `failed` |
 | `cleanup` | 清理旧收发记录与媒体 | `--days 30`，须为正整数 |
@@ -316,6 +333,7 @@ inbox 记录里的 local_time 字段已经是北京时间（如 "2026-10-12 07:5
 wechat-bridge/
 ├── bridge.py          # 登录、消息队列与命令行入口
 ├── media.py           # 媒体加解密、上传下载与输入状态
+├── voice_codec.py     # MP3→SILK 转换、时长校验与缓存
 ├── runtime_io.py      # 私有文件权限与原子写入
 ├── session_store.py   # 会话加解密与旧明文文件迁移
 ├── requirements.txt   # Python 依赖
@@ -386,12 +404,14 @@ python bridge.py status
 python -B -m unittest discover -s tests -v
 ```
 
-检查使用临时目录与模拟 HTTP 响应，覆盖中断恢复、重试、用户隔离、文件锁、权限、凭据加密与明文迁移，以及实际 AES 加解密；Windows 还运行真实 DPAPI 加解密与篡改检测。测试仅使用合成凭据，不登录微信或发送真实消息。Windows 下，运行账户需要具备设置临时目录 ACL 的权限并可使用 DPAPI。
+检查使用临时目录与模拟 HTTP 响应，覆盖中断恢复、重试、用户隔离、文件锁、权限、凭据加密与明文迁移，以及实际 AES 加解密；Windows 还运行真实 DPAPI 加解密与篡改检测。语音检查使用本地生成的测试音调，运行真实 MP3 解码、SILK 编码/回解、时长/缓存完整性验证，以及转码失败、超时和发送重试检查。测试仅使用合成凭据，不登录微信或发送真实消息。Windows 下，运行账户需要具备设置临时目录 ACL 的权限并可使用 DPAPI。
 
 ## 协议依据与许可证
 
 代码中的协议参考为 `tencent/openclaw-weixin` 的 `docs/protocol_zh_CN.md` 及微信开放文档中的 Clawbot 相关接口；媒体字段映射参考 `DONGH4O/wechat-ilink-bridge`。
 
 引用结构、媒体元数据及语音编码枚举依据[腾讯协议类型定义](https://github.com/Tencent/openclaw-weixin/blob/main/src/api/types.ts)，视频消息构造依据[腾讯发送实现](https://github.com/Tencent/openclaw-weixin/blob/main/src/messaging/send.ts)。语音出站目前仅按协议类型构造，并未据此宣称完成微信端验证。
+
+SILK 编码使用 [silk-python](https://github.com/synodriver/pysilk) 的 Python 绑定，底层采用 [kn007/silk-v3-decoder](https://github.com/kn007/silk-v3-decoder)，启用腾讯格式；MP3 解码使用 FFmpeg。[上游子模块来源](https://github.com/synodriver/pysilk/blob/v0.2/.gitmodules)。这些依赖的许可证以各自发布内容为准。
 
 本项目采用 [MIT 许可证](LICENSE)。
