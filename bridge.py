@@ -28,7 +28,8 @@ handling follow the documents above.
 import argparse
 import base64
 import datetime
-import fcntl
+import functools
+import hashlib
 import json
 import os
 import random
@@ -40,6 +41,12 @@ import urllib.error
 import uuid
 
 import media as media_mod
+from runtime_io import atomic_write_json, atomic_write_text, private_directory, private_file
+
+if os.name == "nt":
+    import msvcrt
+else:
+    import fcntl
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 STATE = os.path.join(ROOT, "state")
@@ -58,7 +65,7 @@ LOGIN_WAIT_INTERVAL = 3
 
 def ensure_dirs():
     for d in (STATE, INBOX, OUTBOX):
-        os.makedirs(d, exist_ok=True)
+        private_directory(d)
 
 
 def client_version_str():
@@ -96,28 +103,36 @@ def base_info():
 
 def http_post(base, path, body, bot_token=None, timeout=POLL_HTTP_TIMEOUT,
               for_qrcode=False):
+    if bot_token and time.time() < pause_until():
+        return None, "PAUSED_1H"
     data = json.dumps(body).encode("utf-8")
     req = urllib.request.Request(
         base + path, data=data,
         headers=post_headers(bot_token, for_qrcode=for_qrcode), method="POST")
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            return json.loads(r.read().decode("utf-8")), None
+        with media_mod.open_weixin_url(req, timeout=timeout) as r:
+            resp = json.loads(r.read().decode("utf-8"))
+            if not isinstance(resp, dict):
+                return None, "invalid_response"
+            if bot_token and (resp.get("ret") == -14 or resp.get("errcode") == -14):
+                set_pause(3600)
+            return resp, None
     except urllib.error.HTTPError as e:
         return None, "http_%d" % e.code
     except Exception as e:  # timeout / dns / reset ...
-        return None, "net_%s: %s" % (type(e).__name__, e)
+        return None, "net_%s" % type(e).__name__
 
 
 def http_get(base, path_qs, timeout=POLL_HTTP_TIMEOUT):
     req = urllib.request.Request(base + path_qs, headers=app_headers(), method="GET")
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            return json.loads(r.read().decode("utf-8")), None
+        with media_mod.open_weixin_url(req, timeout=timeout) as r:
+            resp = json.loads(r.read().decode("utf-8"))
+            return (resp, None) if isinstance(resp, dict) else (None, "invalid_response")
     except urllib.error.HTTPError as e:
         return None, "http_%d" % e.code
     except Exception as e:
-        return None, "net_%s: %s" % (type(e).__name__, e)
+        return None, "net_%s" % type(e).__name__
 
 
 # ---------- state ----------
@@ -130,16 +145,57 @@ def load_session():
     p = session_path()
     if not os.path.exists(p):
         return None
+    private_file(p)
     with open(p, "r", encoding="utf-8") as f:
         return json.load(f)
 
 
 def save_session(sess):
-    # atomic write
-    tmp = session_path() + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(sess, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, session_path())
+    atomic_write_json(session_path(), sess)
+
+
+def valid_session(sess):
+    return (isinstance(sess, dict)
+            and all(isinstance(sess.get(k), str) and sess[k].strip()
+                    for k in ("bot_token", "ilink_user_id")))
+
+
+def account_id(sess):
+    identity = [sess.get("ilink_bot_id") or sess["bot_token"], sess["ilink_user_id"]]
+    return hashlib.sha256(json.dumps(identity).encode("utf-8")).hexdigest()
+
+
+def belongs_to_session(rec, sess, inbound=False):
+    user_field = "from_user_id" if inbound else "to_user_id"
+    if not valid_session(sess) or rec.get(user_field) != sess["ilink_user_id"]:
+        return False
+    if rec.get("account_id") and rec["account_id"] != account_id(sess):
+        return False
+    if inbound and sess.get("ilink_bot_id") and rec.get("to_user_id"):
+        return rec["to_user_id"] == sess["ilink_bot_id"]
+    return True
+
+
+def _stamp_legacy_records(previous):
+    """Keep legacy data attached to its previous login before switching accounts."""
+    owner = account_id(previous) if valid_session(previous) else "legacy-unbound"
+    for directory in (INBOX, OUTBOX):
+        for name in os.listdir(directory):
+            if not name.endswith(".json"):
+                continue
+            path = os.path.join(directory, name)
+            with open(path, encoding="utf-8") as f:
+                record = json.load(f)
+            if not record.get("account_id"):
+                record["account_id"] = owner
+                atomic_write_json(path, record)
+    delayed = load_delayed()
+    for queue in delayed.values():
+        for record in queue:
+            if not record.get("account_id"):
+                record["account_id"] = owner
+    if delayed:
+        save_delayed(delayed)
 
 
 def load_cursor():
@@ -151,12 +207,7 @@ def load_cursor():
 
 
 def save_cursor(buf):
-    if not buf:
-        return
-    tmp = os.path.join(STATE, "cursor.txt.tmp")
-    with open(tmp, "w", encoding="utf-8") as f:
-        f.write(buf)
-    os.replace(tmp, os.path.join(STATE, "cursor.txt"))
+    atomic_write_text(os.path.join(STATE, "cursor.txt"), buf)
 
 
 def pause_until():
@@ -171,8 +222,7 @@ def pause_until():
 
 
 def set_pause(seconds):
-    with open(os.path.join(STATE, "pause_until.txt"), "w") as f:
-        f.write(str(time.time() + seconds))
+    atomic_write_text(os.path.join(STATE, "pause_until.txt"), str(time.time() + seconds))
 
 
 def touch_tick():
@@ -189,9 +239,17 @@ class Locked:
 
     def __enter__(self):
         ensure_dirs()
-        self.fp = open(self.path, "w")
+        self.fp = open(self.path, "a+b")
         try:
-            fcntl.flock(self.fp.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            if os.name == "nt":
+                self.fp.seek(0, os.SEEK_END)
+                if self.fp.tell() == 0:
+                    self.fp.write(b"\0")
+                    self.fp.flush()
+                self.fp.seek(0)
+                msvcrt.locking(self.fp.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                fcntl.flock(self.fp.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
             return True
         except OSError:
             self.fp.close()
@@ -201,9 +259,24 @@ class Locked:
     def __exit__(self, *a):
         if self.fp:
             try:
-                fcntl.flock(self.fp.fileno(), fcntl.LOCK_UN)
+                if os.name == "nt":
+                    self.fp.seek(0)
+                    msvcrt.locking(self.fp.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    fcntl.flock(self.fp.fileno(), fcntl.LOCK_UN)
             finally:
                 self.fp.close()
+
+
+def serialized(func):
+    @functools.wraps(func)
+    def run(*args, **kwargs):
+        with Locked() as ok:
+            if not ok:
+                print(json.dumps({"ok": True, "skipped": "locked"}))
+                return 0
+            return func(*args, **kwargs)
+    return run
 
 
 def log(msg):
@@ -236,12 +309,15 @@ def log_history(direction, text, user_id=None, attachments=None):
     }
     if attachments:
         entry["attachments"] = attachments
-    with open(os.path.join(ROOT, "history.jsonl"), "a", encoding="utf-8") as f:
+    path = os.path.join(ROOT, "history.jsonl")
+    with open(path, "a", encoding="utf-8") as f:
+        private_file(path)
         f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
 
 # ---------- login ----------
 
+@serialized
 def cmd_login(args):
     ensure_dirs()
     sess = load_session()
@@ -259,9 +335,8 @@ def cmd_login(args):
         print(json.dumps({"ok": False, "error": "no_qrcode_in_response"},
                          ensure_ascii=False))
         return 1
-    with open(os.path.join(STATE, "qr.json"), "w", encoding="utf-8") as f:
-        json.dump({"qrcode": qrcode, "base": base, "at": time.time()}, f,
-                  ensure_ascii=False)
+    atomic_write_json(os.path.join(STATE, "qr.json"),
+                      {"qrcode": qrcode, "base": base, "at": time.time()})
     png_path = os.path.join(STATE, "qr.png")
     rendered = render_qr(qrcode, img, png_path)
     print(json.dumps({
@@ -280,8 +355,8 @@ def render_qr(qrcode_value, img_content, png_path):
         if img_content.startswith(("http://", "https://")):
             try:
                 req = urllib.request.Request(img_content, method="GET")
-                with urllib.request.urlopen(req, timeout=20) as r:
-                    data = r.read()
+                with media_mod.open_weixin_url(req, timeout=20) as r:
+                    data = media_mod.read_bounded(r, 2 * 1024 * 1024)
                 with open(png_path, "wb") as f:
                     f.write(data)
                 return True
@@ -304,6 +379,7 @@ def render_qr(qrcode_value, img_content, png_path):
         return False
 
 
+@serialized
 def cmd_wait_login(args):
     ensure_dirs()
     qp = os.path.join(STATE, "qr.json")
@@ -335,10 +411,16 @@ def cmd_wait_login(args):
                 "baseurl": resp.get("baseurl") or base,
                 "bound_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
             }
-            if not sess["bot_token"]:
-                print(json.dumps({"ok": False, "error": "confirmed_but_no_token"},
+            if not valid_session(sess):
+                print(json.dumps({"ok": False, "error": "confirmed_but_incomplete_identity"},
                                  ensure_ascii=False))
                 return 1
+            media_mod.validate_weixin_url(sess["baseurl"])
+            previous = load_session()
+            if not valid_session(previous) or account_id(previous) != account_id(sess):
+                _stamp_legacy_records(previous)
+                save_cursor("")
+                set_pause(0)
             save_session(sess)
             try:
                 os.remove(qp)
@@ -403,7 +485,7 @@ def cmd_poll(args):
 
 def _poll_locked(args):
     sess = load_session()
-    if not sess or not sess.get("bot_token"):
+    if not valid_session(sess):
         print(json.dumps({"ok": False, "error": "NO_SESSION"}, ensure_ascii=False))
         return 0
     if time.time() < pause_until():
@@ -411,7 +493,6 @@ def _poll_locked(args):
         return 0
     base = sess.get("baseurl") or DEFAULT_BASE
     token = sess["bot_token"]
-    bound_user = sess.get("ilink_user_id")
     batch = time.strftime("%Y%m%dT%H%M%S")
     resp, err = http_post(
         base, "/ilink/bot/getupdates",
@@ -433,14 +514,14 @@ def _poll_locked(args):
         log("getupdates ret -14: pausing 1h per protocol doc")
         print(json.dumps({"ok": False, "error": "PAUSED_1H"}, ensure_ascii=False))
         return 0
-    if ret not in (0, None):
-        log("getupdates business error: %s" % json.dumps(resp, ensure_ascii=False)[:300])
-        print(json.dumps({"ok": False, "error": "business_ret_%s" % ret},
+    errcode = resp.get("errcode")
+    if ret not in (0, None) or errcode not in (0, None):
+        code = ret if ret not in (0, None) else errcode
+        log("getupdates business error: code=%s" % code)
+        print(json.dumps({"ok": False, "error": "business_code_%s" % code},
                          ensure_ascii=False))
         return 0
     buf = resp.get("get_updates_buf")
-    if buf:
-        save_cursor(buf)
     added = 0
     for m in resp.get("msgs", []) or []:
         if m.get("message_type") != 1:  # only inbound user messages
@@ -448,16 +529,36 @@ def _poll_locked(args):
         if m.get("group_id"):  # ignore group chats
             log("skip group message")
             continue
-        if bound_user and m.get("from_user_id") != bound_user:
+        if not belongs_to_session(m, sess, inbound=True):
             log("skip message from non-bound user")
             continue
         key = "%s_%s" % (m.get("seq"), m.get("message_id"))
+        outbox_path(key)
         ipath = os.path.join(INBOX, key + ".json")
         if os.path.exists(ipath):
-            continue  # dedup
+            with open(ipath, encoding="utf-8") as f:
+                previous = json.load(f)
+            if belongs_to_session(previous, sess, inbound=True):
+                if not previous.get("delayed_flushed", True):
+                    _flush_delayed(m.get("from_user_id"), m.get("context_token"))
+                    previous["delayed_flushed"] = True
+                    atomic_write_json(ipath, previous)
+                continue  # dedup
+            # Different accounts can reuse sequence/message IDs; retain the old record.
+            key = account_id(sess)[:16] + "_" + key
+            ipath = os.path.join(INBOX, key + ".json")
+            if os.path.exists(ipath):
+                with open(ipath, encoding="utf-8") as f:
+                    previous = json.load(f)
+                if not previous.get("delayed_flushed", True):
+                    _flush_delayed(m.get("from_user_id"), m.get("context_token"))
+                    previous["delayed_flushed"] = True
+                    atomic_write_json(ipath, previous)
+                continue
         text, has_media = extract_text_and_media(m)
         rec = {
             "key": key,
+            "account_id": account_id(sess),
             "message_id": m.get("message_id"),
             "seq": m.get("seq"),
             "from_user_id": m.get("from_user_id"),
@@ -472,6 +573,7 @@ def _poll_locked(args):
             "batch": batch,
             "status": "new",
             "attachments": [],
+            "delayed_flushed": False,
         }
         # download inbound media (image/file/voice/video) for the agent
         try:
@@ -492,10 +594,7 @@ def _poll_locked(args):
                 })
         except Exception as e:
             log("media download error %s: %s" % (key, e))
-        tmp = ipath + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(rec, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, ipath)
+        atomic_write_json(ipath, rec)
         added += 1
         log_history(
             "in",
@@ -508,6 +607,11 @@ def _poll_locked(args):
             % (key, has_media, len(text), len(rec["attachments"])))
         # flush delayed queue: retry first queued reply with fresh context
         _flush_delayed(m.get("from_user_id"), m.get("context_token"))
+        rec["delayed_flushed"] = True
+        atomic_write_json(ipath, rec)
+    # A replay after a crash is safe because inbox writes are atomic and deduplicated.
+    if buf:
+        save_cursor(buf)
     print(json.dumps({"ok": True, "new": added}, ensure_ascii=False))
     return 0
 
@@ -520,23 +624,19 @@ def load_delayed():
     p = delayed_path()
     if not os.path.exists(p):
         return {}
-    try:
-        with open(p, encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {}
+    with open(p, encoding="utf-8") as f:
+        return json.load(f)
 
 
 def save_delayed(d):
-    tmp = delayed_path() + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(d, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, delayed_path())
+    atomic_write_json(delayed_path(), d)
 
 
 def _to_delayed(o):
     d = load_delayed()
-    d.setdefault(o["to_user_id"], []).append(o)
+    queue = d.setdefault(o["to_user_id"], [])
+    if not any(entry["reply_to"] == o["reply_to"] for entry in queue):
+        queue.append(o)
     save_delayed(d)
     log("moved to delayed queue for user ...%s" % o["to_user_id"][-8:])
 
@@ -548,14 +648,31 @@ def _flush_delayed(user_id, fresh_context_token):
     q = d.get(user_id)
     if not q:
         return
-    entry = q.pop(0)
+    sess = load_session()
+    index = next((i for i, entry in enumerate(q) if belongs_to_session(entry, sess)), None)
+    if index is None:
+        return
+    entry = q.pop(index)
     if not q:
         d.pop(user_id, None)
     entry["context_token"] = fresh_context_token or entry.get("context_token")
     entry["status"] = "pending"
     entry["attempts"] = 0
     entry["last_error"] = ""
-    _write_outbox(os.path.join(OUTBOX, entry["reply_to"] + ".json"), entry)
+    path = outbox_path(entry["reply_to"])
+    if os.path.exists(path):
+        with open(path, encoding="utf-8") as f:
+            existing = json.load(f)
+        # Recovery after a crash between writing outbox and removing delayed entry.
+        if (existing.get("status") != "delayed"
+                and not (existing.get("status") == "pending" and existing.get("attempts", 0) >= 3)):
+            save_delayed(d)
+            return
+        # The outbox copy can have newer progress than an interrupted queue move.
+        entry = existing
+        entry.update(context_token=fresh_context_token or entry.get("context_token"),
+                     status="pending", attempts=0, last_error="")
+    _write_outbox(path, entry)
     save_delayed(d)
     log("flushed 1 delayed reply for user ...%s" % user_id[-8:])
 
@@ -564,7 +681,7 @@ def _flush_delayed(user_id, fresh_context_token):
 
 def cmd_send(args):
     ensure_dirs()
-    with Locked("send.lock") as ok:
+    with Locked() as ok:
         if not ok:
             print(json.dumps({"ok": True, "skipped": "locked"}, ensure_ascii=False))
             return 0
@@ -573,8 +690,11 @@ def cmd_send(args):
 
 def _send_locked(args):
     sess = load_session()
-    if not sess or not sess.get("bot_token"):
+    if not valid_session(sess):
         print(json.dumps({"ok": False, "error": "NO_SESSION"}, ensure_ascii=False))
+        return 0
+    if time.time() < pause_until():
+        print(json.dumps({"ok": True, "skipped": "paused"}))
         return 0
     base = sess.get("baseurl") or DEFAULT_BASE
     token = sess["bot_token"]
@@ -583,53 +703,61 @@ def _send_locked(args):
     files = sorted(f for f in os.listdir(OUTBOX) if f.endswith(".json"))
     for fn in files:
         p = os.path.join(OUTBOX, fn)
-        with open(p, encoding="utf-8") as f:
-            o = json.load(f)
-        if o.get("status") != "pending":
-            continue
-        if o.get("attempts", 0) >= 3:
-            # give up for now -> delayed queue, retried on next inbound
-            try:
-                os.remove(p)
-            except OSError:
-                pass
-            _to_delayed(o)
+        try:
+            with open(p, encoding="utf-8") as f:
+                o = json.load(f)
+            if not isinstance(o, dict):
+                raise ValueError("invalid outbox record")
+        except (OSError, ValueError):
+            log("invalid outbox record retained: %s" % fn)
             failed += 1
             continue
-        payloads = []  # list of item_lists to send in order
-        media_spec = o.get("media")
-        if media_spec:
-            try:
-                item = media_mod.upload_media(
-                    http_post, sess, o["to_user_id"],
-                    media_spec["path"], media_spec["kind"])
-                payloads.append([item])
-            except Exception as e:
-                o["attempts"] = o.get("attempts", 0) + 1
-                o["last_error"] = "media: %s" % e
-                _write_outbox(p, o)
-                log("send media fail %s: %s" % (fn, e))
-                failed += 1
-                continue
-        if o.get("text"):
-            payloads.append([{"type": 1, "text_item": {"text": o["text"]}}])
-        if not payloads:
-            o["status"] = "sent"
-            _write_outbox(p, o)
-            sent += 1
+        if o.get("status") != "pending":
             continue
+        if not belongs_to_session(o, sess):
+            log("skip outbox from another account: %s" % fn)
+            continue
+        if o.get("attempts", 0) >= 3:
+            # Keep both copies until the queue move is durable; retries deduplicate.
+            _to_delayed(o)
+            o["status"] = "delayed"
+            _write_outbox(p, o)
+            failed += 1
+            continue
+        if "delivery" not in o:
+            o["delivery"] = []
+            if o.get("media"):
+                o["delivery"].append({"kind": "media", "client_id": uuid.uuid4().hex,
+                                      "item_list": None, "sent": False})
+            if o.get("text"):
+                o["delivery"].append({
+                    "kind": "text", "client_id": uuid.uuid4().hex, "sent": False,
+                    "item_list": [{"type": 1, "text_item": {"text": o["text"]}}],
+                })
+            o["account_id"] = account_id(sess)
+            # IDs are on disk before any network operation, including the first attempt.
+            _write_outbox(p, o)
 
         def _do_send():
-            for item_list in payloads:
+            for part in o["delivery"]:
+                if part["sent"]:
+                    continue
+                if time.time() < pause_until():
+                    raise RuntimeError("PAUSED_1H")
+                if part["item_list"] is None:
+                    spec = o["media"]
+                    part["item_list"] = [media_mod.upload_media(
+                        http_post, sess, o["to_user_id"], spec["path"], spec["kind"])]
+                    _write_outbox(p, o)
                 body = {
                     "msg": {
                         "from_user_id": "",
                         "to_user_id": o["to_user_id"],
-                        "client_id": uuid.uuid4().hex,
+                        "client_id": part["client_id"],
                         "message_type": 2,
                         "message_state": 2,
                         "context_token": o.get("context_token") or "",
-                        "item_list": item_list,
+                        "item_list": part["item_list"],
                     },
                     "base_info": base_info(),
                 }
@@ -640,9 +768,13 @@ def _send_locked(args):
                 # Per protocol doc: only non-zero ret is a failure;
                 # missing ret is NOT a failure (server returns message_id).
                 ret = (resp or {}).get("ret")
+                if ret == -14 or (resp or {}).get("errcode") == -14:
+                    set_pause(3600)
+                    raise RuntimeError("PAUSED_1H")
                 if ret not in (None, 0):
-                    raise RuntimeError("business: ret=%s %s" % (
-                        ret, ((resp or {}).get("errmsg") or "")[:120]))
+                    raise RuntimeError("business: ret=%s" % ret)
+                part["sent"] = True
+                _write_outbox(p, o)
 
         try:
             if use_typing:
@@ -652,11 +784,15 @@ def _send_locked(args):
             else:
                 _do_send()
         except Exception as e:
-            o["attempts"] = o.get("attempts", 0) + 1
+            paused = time.time() < pause_until()
+            if not paused:
+                o["attempts"] = o.get("attempts", 0) + 1
             o["last_error"] = str(e)[:200]
             _write_outbox(p, o)
             log("send fail %s: %s" % (fn, e))
             failed += 1
+            if paused:
+                break
             continue
         o["status"] = "sent"
         o["last_error"] = ""
@@ -677,20 +813,33 @@ def _send_locked(args):
 
 
 def _write_outbox(path, obj):
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(obj, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, path)
+    atomic_write_json(path, obj)
+
+
+def outbox_path(key):
+    if not isinstance(key, str) or not key or any(c in key for c in '/\\\x00:') or key in (".", ".."):
+        raise ValueError("invalid message key")
+    return os.path.join(OUTBOX, key + ".json")
 
 
 def queue_reply(reply_to, to_user_id, context_token, text, media=None):
     """Queue a reply. media: {"kind": "image"|"file", "path": ...} or None."""
-    ensure_dirs()
-    p = os.path.join(OUTBOX, reply_to + ".json")
+    with Locked() as ok:
+        if not ok:
+            raise RuntimeError("bridge busy; retry queue_reply later")
+        return _queue_reply_locked(reply_to, to_user_id, context_token, text, media)
+
+
+def _queue_reply_locked(reply_to, to_user_id, context_token, text, media=None):
+    sess = load_session()
+    if not valid_session(sess) or to_user_id != sess["ilink_user_id"]:
+        raise ValueError("reply recipient is not the bound user")
+    p = outbox_path(reply_to)
     if os.path.exists(p):
         return p  # already queued/sent; never duplicate
     _write_outbox(p, {
         "reply_to": reply_to,
+        "account_id": account_id(sess),
         "to_user_id": to_user_id,
         "context_token": context_token or "",
         "text": text,
@@ -704,8 +853,10 @@ def queue_reply(reply_to, to_user_id, context_token, text, media=None):
 
 # ---------- mark / status / serve ----------
 
+@serialized
 def cmd_mark(args):
     ensure_dirs()
+    outbox_path(args.key)  # apply the same path validation to inbox keys
     p = os.path.join(INBOX, args.key + ".json")
     if not os.path.exists(p):
         print(json.dumps({"ok": False, "error": "not_found"}, ensure_ascii=False))
@@ -715,10 +866,7 @@ def cmd_mark(args):
     rec["status"] = args.status
     if args.note:
         rec["note"] = args.note
-    tmp = p + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(rec, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, p)
+    atomic_write_json(p, rec)
     print(json.dumps({"ok": True}, ensure_ascii=False))
     return 0
 
@@ -770,8 +918,11 @@ def cmd_status(args):
     return 0
 
 
-def _latest_inbound():
+def _latest_inbound(sess=None):
     """Latest inbox message from the bound user (for manual sends)."""
+    sess = sess or load_session()
+    if not valid_session(sess):
+        return None
     best = None
     if not os.path.isdir(INBOX):
         return None
@@ -783,22 +934,25 @@ def _latest_inbound():
                 rec = json.load(f)
         except Exception:
             continue
+        if not belongs_to_session(rec, sess, inbound=True):
+            continue
         if best is None or (rec.get("create_time_ms") or 0) > (best.get("create_time_ms") or 0):
             best = rec
     return best
 
 
+@serialized
 def cmd_send_media(args):
     ensure_dirs()
     sess = load_session()
-    if not sess or not sess.get("bot_token"):
+    if not valid_session(sess):
         print(json.dumps({"ok": False, "error": "NO_SESSION"}, ensure_ascii=False))
         return 1
     if not os.path.isfile(args.path):
         print(json.dumps({"ok": False, "error": "file not found: %s" % args.path},
                          ensure_ascii=False))
         return 1
-    rec = _latest_inbound()
+    rec = _latest_inbound(sess)
     if not rec or not rec.get("context_token"):
         print(json.dumps(
             {"ok": False, "error": "NO_CONTEXT_TOKEN",
@@ -807,6 +961,7 @@ def cmd_send_media(args):
     key = "manual_%s" % uuid.uuid4().hex[:12]
     _write_outbox(os.path.join(OUTBOX, key + ".json"), {
         "reply_to": key,
+        "account_id": account_id(sess),
         "to_user_id": rec["from_user_id"],
         "context_token": rec["context_token"],
         "text": args.text or "",
@@ -835,12 +990,10 @@ def load_proactive():
 
 
 def save_proactive(d):
-    tmp = proactive_path() + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(d, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, proactive_path())
+    atomic_write_json(proactive_path(), d)
 
 
+@serialized
 def cmd_send_proactive(args):
     """Queue a proactive message (not a reply). Cooldown per kind."""
     ensure_dirs()
@@ -856,17 +1009,37 @@ def cmd_send_proactive(args):
         print(json.dumps({"ok": False, "error": "NO_CONTEXT_TOKEN"},
                          ensure_ascii=False))
         return 1
-    key = "proactive_%s_%s" % (args.kind, time.strftime("%Y%m%dT%H%M%S"))
-    queue_reply(key, rec["from_user_id"], rec["context_token"], args.text)
+    key = "proactive_%s" % uuid.uuid4().hex
+    _queue_reply_locked(key, rec["from_user_id"], rec["context_token"], args.text)
     d[args.kind] = now
     save_proactive(d)
     print(json.dumps({"ok": True, "queued": key}, ensure_ascii=False))
     return 0
 
 
+@serialized
 def cmd_cleanup(args):
     ensure_dirs()
+    if args.days < 1:
+        raise ValueError("cleanup days must be positive")
     cutoff = time.time() - args.days * 86400
+    retained_media = set()
+    for name in os.listdir(OUTBOX):
+        if not name.endswith(".json"):
+            continue
+        try:
+            with open(os.path.join(OUTBOX, name), encoding="utf-8") as f:
+                entry = json.load(f)
+            if entry.get("status") != "sent" and entry.get("media"):
+                retained_media.add(os.path.abspath(entry["media"]["path"]))
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            # Unknown references: retain media until the damaged record is repaired.
+            print(json.dumps({"ok": False, "error": "invalid_outbox_record"}))
+            return 1
+    for queue in load_delayed().values():
+        for entry in queue:
+            if entry.get("media"):
+                retained_media.add(os.path.abspath(entry["media"]["path"]))
     removed = 0
     for d in (INBOX, OUTBOX, os.path.join(ROOT, "media")):
         if not os.path.isdir(d):
@@ -875,10 +1048,20 @@ def cmd_cleanup(args):
             for fn in files:
                 p = os.path.join(root, fn)
                 try:
+                    if os.path.abspath(p) in retained_media:
+                        continue
+                    if d == OUTBOX and fn.endswith(".json"):
+                        with open(p, encoding="utf-8") as f:
+                            if json.load(f).get("status") != "sent":
+                                continue  # never delete an undelivered reply
+                    if d == INBOX and fn.endswith(".json"):
+                        with open(p, encoding="utf-8") as f:
+                            if json.load(f).get("status") not in ("done", "failed"):
+                                continue
                     if os.path.getmtime(p) < cutoff:
                         os.remove(p)
                         removed += 1
-                except OSError:
+                except (OSError, ValueError):
                     pass
     # drop empty dirs under media/
     md = os.path.join(ROOT, "media")

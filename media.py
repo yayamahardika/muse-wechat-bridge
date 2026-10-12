@@ -17,6 +17,7 @@ import urllib.request
 import uuid
 
 from Crypto.Cipher import AES
+from runtime_io import private_directory, private_file
 
 CDN_BASE = "https://novac2c.cdn.weixin.qq.com/c2c"
 MAX_MEDIA_BYTES = 25 * 1024 * 1024
@@ -37,14 +38,56 @@ MIME_BY_EXT = {
 }
 
 
+def validate_weixin_url(url):
+    """Only HTTPS endpoints within the official Weixin domain are trusted."""
+    parsed = urllib.parse.urlsplit(url)
+    host = (parsed.hostname or "").lower()
+    if (parsed.scheme != "https" or parsed.username is not None
+            or parsed.password is not None or parsed.port not in (None, 443)
+            or not (host == "weixin.qq.com" or host.endswith(".weixin.qq.com"))):
+        raise ValueError("untrusted Weixin URL")
+    return url
+
+
+class _SafeRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        validate_weixin_url(newurl)
+        if (req.has_header("Authorization")
+                and urllib.parse.urlsplit(req.full_url).hostname
+                != urllib.parse.urlsplit(newurl).hostname):
+            raise ValueError("cross-host authenticated redirect refused")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def open_weixin_url(req, timeout):
+    validate_weixin_url(req.full_url)
+    return urllib.request.build_opener(_SafeRedirect()).open(req, timeout=timeout)
+
+
+def read_bounded(response, limit):
+    length = response.headers.get("Content-Length")
+    if length is not None and int(length) > limit:
+        raise ValueError("download too large")
+    data = bytearray()
+    while True:
+        chunk = response.read(min(64 * 1024, limit + 1 - len(data)))
+        if not chunk:
+            return bytes(data)
+        data.extend(chunk)
+        if len(data) > limit:
+            raise ValueError("download too large")
+
+
 def _pad(data):
     n = 16 - (len(data) % 16)
     return data + bytes([n]) * n
 
 
 def _unpad(data):
+    if not data:
+        raise ValueError("empty pkcs7 data")
     n = data[-1]
-    if n < 1 or n > 16:
+    if n < 1 or n > 16 or len(data) < n or data[-n:] != bytes([n]) * n:
         raise ValueError("bad pkcs7 padding")
     return data[:-n]
 
@@ -126,20 +169,26 @@ def download_attachment(session, media_ref, aeskey_value, dest_path,
         if not param:
             return False, "no download param"
         url = base_cdn + "/download?encrypted_query_param=" + urllib.parse.quote(param, safe="")
-    req = urllib.request.Request(url, method="GET")
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            data = r.read()
+        validate_weixin_url(url)
+        key = decode_aes_key(aeskey_value) or decode_aes_key(media_ref.get("aes_key"))
+        if (aeskey_value or media_ref.get("aes_key")) and key is None:
+            return False, "invalid AES key"
+        req = urllib.request.Request(url, method="GET")
+        with open_weixin_url(req, timeout=timeout) as r:
+            data = read_bounded(r, MAX_MEDIA_BYTES + (16 if key is not None else 0))
     except Exception as e:
-        return False, "download failed: %s" % e
-    key = decode_aes_key(aeskey_value) or decode_aes_key(media_ref.get("aes_key"))
+        return False, "download failed: %s" % type(e).__name__
     if key is not None:
         try:
             data = aes_ecb_decrypt(data, key)
         except Exception as e:
-            return False, "decrypt failed: %s" % e
-    os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+            return False, "decrypt failed: %s" % type(e).__name__
+    if len(data) > MAX_MEDIA_BYTES:
+        return False, "download too large"
+    private_directory(os.path.dirname(os.path.abspath(dest_path)))
     with open(dest_path, "wb") as f:
+        private_file(dest_path)
         f.write(data)
     return True, sniff_mime(data)
 
@@ -162,7 +211,9 @@ def upload_media(api_post, session, to_user_id, file_path, kind):
     if not mime or (kind == "image" and not mime.startswith("image/")):
         raise ValueError("unsupported type for %s: %s" % (kind, ext or "?"))
     with open(file_path, "rb") as f:
-        raw = f.read()
+        raw = f.read(MAX_MEDIA_BYTES + 1)
+    if len(raw) > MAX_MEDIA_BYTES:
+        raise ValueError("file too large (>25MB)")
     key = os.urandom(16)
     key_hex = key.hex()
     enc = aes_ecb_encrypt(raw, key)
@@ -192,21 +243,18 @@ def upload_media(api_post, session, to_user_id, file_path, kind):
         up = resp.get("upload_param")
         if not up:
             raise RuntimeError("no upload url in getUploadUrl response")
-        upload_url = (base + "/upload?encrypted_query_param="
+        upload_url = (CDN_BASE + "/upload?encrypted_query_param="
                       + urllib.parse.quote(up, safe="") + "&filekey=" + filekey)
     req = urllib.request.Request(upload_url, data=enc, method="POST",
                                  headers={"Content-Type": "application/octet-stream"})
     try:
-        with urllib.request.urlopen(req, timeout=60) as r:
+        with open_weixin_url(req, timeout=60) as r:
             status = r.status
             dl_param = r.headers.get("x-encrypted-param")
     except Exception as e:
-        raise RuntimeError("cdn upload failed: %s" % e)
+        raise RuntimeError("cdn upload failed: %s" % type(e).__name__)
     if status != 200 or not dl_param:
-        # fall back to params possibly present in getUploadUrl response
-        dl_param = dl_param or resp.get("encrypt_query_param")
-        if not dl_param:
-            raise RuntimeError("upload ok but no download param returned")
+        raise RuntimeError("CDN upload missing success status or download param")
     media = {
         "encrypt_query_param": dl_param,
         "aes_key": base64.b64encode(key_hex.encode("ascii")).decode("ascii"),
