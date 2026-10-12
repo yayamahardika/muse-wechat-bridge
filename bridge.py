@@ -14,11 +14,11 @@ Subcommands:
   login       获取登录二维码（不轮询）
   wait-login  轮询二维码状态直到确认/过期
   poll        拉取新消息 -> inbox/，自动下载媒体附件（带锁，cron 调用）
-  send        发送 outbox/ 中待发送回复，支持文字/图片/文件/视频/语音（带锁）
+  send        发送 outbox/ 中待发送回复，支持文字/图片/文件/视频（带锁）
   send-file   发送本地文件（需先有对方消息的 context）
   send-image  发送本地图片（需先有对方消息的 context）
   send-video  发送本地 MP4 视频（需先有对方消息的 context）
-  send-voice  发送 MP3（自动转 SILK）或本地 SILK 语音（实验性）
+  send-voice  发送音频文件卡片，MP3/WAV 直传，SILK 转 WAV
   mark        标记 inbox 消息状态（供执行者用）
   cleanup     清理 N 天前的收发记录与媒体（默认 30 天）
   serve       前台轮询循环（调试用；生产由 cron tick 驱动）
@@ -874,35 +874,33 @@ def _send_locked(args):
             _write_outbox(p, o)
 
         def _do_send():
+            cached_voice = any(item.get("type") == 3 for part in o["delivery"]
+                               for item in part.get("item_list") or [])
+            if (o.get("media") or {}).get("kind") == "voice" or cached_voice:
+                if not o.get("media"):
+                    raise ValueError("Native VOICE is disabled; an audio source is required for FILE delivery")
+                spec = o["media"]
+                o["media"] = voice_codec.prepare_audio_file(
+                    spec["path"], os.path.join(ROOT, "media", "audio-cache"), spec.get("source_path"))
+                for part in o["delivery"]:
+                    if part["kind"] == "media":
+                        # A FILE is a new payload: do not reuse a VOICE upload or its client ID.
+                        part.update(item_list=None, sent=False, client_id=uuid.uuid4().hex)
+                        part.pop("message_id", None)
+                        part.pop("silk_validated", None)
+                _write_outbox(p, o)
             for part in o["delivery"]:
                 if part["sent"]:
                     continue
                 if time.time() < pause_until():
                     raise RuntimeError("PAUSED_1H")
-                if part["kind"] == "media" and o["media"]["kind"] == "voice":
-                    media_mod.validate_media_spec(o["media"])
-                    if (part["item_list"] is None
-                            and os.path.splitext(o["media"]["path"])[1].lower() == ".mp3"):
-                        o["media"] = voice_codec.prepare_mp3(
-                            o["media"]["path"], os.path.join(ROOT, "media", "voice-cache"))
-                        # Persist conversion before uploading so retries use the same SILK.
-                        _write_outbox(p, o)
-                    # Older pending uploads may already contain an unplayable MP3 item.
-                    if part["item_list"] is not None:
-                        if any(item.get("type") != 3 or
-                               (item.get("voice_item") or {}).get("encode_type") != 6
-                               for item in part["item_list"]):
-                            raise ValueError("cached voice upload is not SILK; queue a new SILK reply")
-                        if not part.get("silk_validated"):
-                            media_mod.validate_silk_file(o["media"]["path"])
-                            part["silk_validated"] = True
                 if part["item_list"] is None:
                     spec = o["media"]
                     part["item_list"] = [media_mod.upload_media(
                         http_post, sess, o["to_user_id"], spec["path"], spec["kind"], options=spec)]
-                    if spec["kind"] == "voice":
-                        part["silk_validated"] = True
                     _write_outbox(p, o)
+                if any(item.get("type") == 3 for item in part["item_list"]):
+                    raise ValueError("Native VOICE bubbles are disabled; use audio FILE delivery")
                 body = {
                     "msg": {
                         "from_user_id": "",
@@ -980,7 +978,7 @@ def outbox_path(key):
 
 
 def queue_reply(reply_to, to_user_id, context_token, text, media=None):
-    """Queue image/file/video/voice. MP3 voice is converted automatically when sending."""
+    """Queue image/file/video or audio. The voice alias always sends playable FILE media."""
     with Locked() as ok:
         if not ok:
             raise RuntimeError("bridge busy; retry queue_reply later")
@@ -1300,13 +1298,13 @@ def main():
     video.add_argument("path")
     video.add_argument("--text", default="")
 
-    voice = sub.add_parser("send-voice", help="experimental: queue MP3 (auto SILK) or SILK V3 audio")
+    voice = sub.add_parser("send-voice", help="queue audio FILE: MP3/WAV directly, SILK decoded to WAV")
     voice.add_argument("path")
-    voice.add_argument("--text", default="")
-    voice.add_argument("--encode-type", type=int, choices=[6], default=6, help="SILK only (default: 6)")
-    voice.add_argument("--sample-rate", type=int, default=None, help="Hz; required for SILK, automatic for MP3")
-    voice.add_argument("--playtime", type=int, default=None, help="milliseconds; required for SILK, automatic for MP3")
-    voice.add_argument("--bits-per-sample", type=int, default=None, help="optional source bit depth")
+    voice.add_argument("--text", default="点击播放")
+    voice.add_argument("--encode-type", type=int, choices=[6], default=6, help="legacy option; ignored for FILE delivery")
+    voice.add_argument("--sample-rate", type=int, default=None, help="legacy option; ignored for FILE delivery")
+    voice.add_argument("--playtime", type=int, default=None, help="legacy option; ignored for FILE delivery")
+    voice.add_argument("--bits-per-sample", type=int, default=None, help="legacy option; ignored for FILE delivery")
 
     cc = sub.add_parser("cleanup")
     cc.add_argument("--days", type=int, default=30)

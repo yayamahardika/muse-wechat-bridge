@@ -25,9 +25,6 @@ MAX_MEDIA_BYTES = 25 * 1024 * 1024
 ITEM_KIND = {2: "image", 3: "voice", 4: "file", 5: "video"}
 UPLOAD_MEDIA_TYPE = {"image": 1, "video": 2, "file": 3, "voice": 4}
 OUTGOING_ITEM_TYPE = {"image": 2, "voice": 3, "file": 4, "video": 5}
-VOICE_EXTENSIONS = {
-    6: (".silk", ".sil"),
-}
 SILK_HEADERS = (b"#!SILK_V3", b"\x02#!SILK_V3")
 METADATA_FIELDS = {
     "image": ("mid_size", "hd_size", "thumb_size", "thumb_width", "thumb_height"),
@@ -241,27 +238,14 @@ def validate_media_spec(spec, check_file=False):
     if not isinstance(spec.get("path"), str) or not spec["path"]:
         raise ValueError("media path is required")
     if spec["kind"] == "voice":
-        encoding = spec.get("encode_type", 6)
-        if type(encoding) is not int or encoding not in VOICE_EXTENSIONS:
-            raise ValueError("outgoing voice uses SILK (encode_type=6); omit encode_type for automatic MP3 conversion")
         extension = os.path.splitext(spec["path"])[1].lower()
-        if extension == ".mp3":
-            if check_file:
-                if not os.path.isfile(spec["path"]):
-                    raise ValueError("MP3 source file does not exist")
-                if not 0 < os.path.getsize(spec["path"]) <= MAX_MEDIA_BYTES:
-                    raise ValueError("MP3 source must be nonempty and no larger than 25 MiB")
-            return  # The sending worker derives all output metadata from decoded audio.
-        for field in ("sample_rate", "playtime"):
-            if type(spec.get(field)) is not int or spec[field] <= 0:
-                raise ValueError("voice %s must be a positive integer" % field)
-        bits = spec.get("bits_per_sample")
-        if bits is not None and (type(bits) is not int or not 1 <= bits <= 64):
-            raise ValueError("voice bits_per_sample must be an integer from 1 to 64")
-        if extension not in VOICE_EXTENSIONS[encoding]:
-            raise ValueError("voice input must be MP3 or SILK V3")
+        if extension not in (".mp3", ".wav", ".silk", ".sil"):
+            raise ValueError("audio replies require MP3, WAV or SILK input")
         if check_file:
-            validate_silk_file(spec["path"])
+            if not os.path.isfile(spec["path"]) or not 0 < os.path.getsize(spec["path"]) <= MAX_MEDIA_BYTES:
+                raise ValueError("audio source must be nonempty and no larger than 25 MiB")
+            if extension in (".silk", ".sil"):
+                validate_silk_file(spec["path"])
     if spec["kind"] == "video" and os.path.splitext(spec["path"])[1].lower() != ".mp4":
         raise ValueError("video currently requires an MP4 file")
 
@@ -303,14 +287,12 @@ def upload_media(api_post, session, to_user_id, file_path, kind, options=None):
     """
     Encrypt + upload a local file, return the sendMessage item dict.
     api_post: callable(base, path, body, bot_token, timeout) -> (resp, err)
-    kind: image/file/video/voice. Voice options must describe the supplied audio.
+    kind: image/file/video. The voice convenience entry point prepares FILE media first.
     """
+    if kind == "voice":
+        raise ValueError("Native VOICE bubbles are disabled; send-voice sends audio as a FILE")
     spec = dict(options or {}, kind=kind, path=file_path)
     validate_media_spec(spec)
-    if kind == "voice" and os.path.splitext(file_path)[1].lower() == ".mp3":
-        raise ValueError("MP3 must be converted before upload; use bridge.py send-voice")
-    if kind == "voice":
-        spec["encode_type"] = 6
     if not os.path.isfile(file_path):
         raise ValueError("not a file: %s" % file_path)
     size = os.path.getsize(file_path)
@@ -318,7 +300,7 @@ def upload_media(api_post, session, to_user_id, file_path, kind, options=None):
         raise ValueError("file too large (>25MB)")
     ext = os.path.splitext(file_path)[1].lower()
     mime = MIME_BY_EXT.get(ext)
-    if (not mime and kind != "voice") or (kind == "image" and not mime.startswith("image/")):
+    if not mime or (kind == "image" and not mime.startswith("image/")):
         raise ValueError("unsupported type for %s: %s" % (kind, ext or "?"))
     with open(file_path, "rb") as f:
         raw = f.read(MAX_MEDIA_BYTES + 1)
@@ -326,8 +308,6 @@ def upload_media(api_post, session, to_user_id, file_path, kind, options=None):
         raise ValueError("file too large (>25MB)")
     if kind == "video" and sniff_mime(raw) != "video/mp4":
         raise ValueError("video file does not have an MP4 header")
-    if kind == "voice":
-        _validate_silk_header(raw[:32], len(raw))
     key = os.urandom(16)
     key_hex = key.hex()
     enc = aes_ecb_encrypt(raw, key)
@@ -380,11 +360,6 @@ def upload_media(api_post, session, to_user_id, file_path, kind, options=None):
     if kind == "video":
         return {"type": OUTGOING_ITEM_TYPE["video"],
                 "video_item": {"media": media, "video_size": len(enc)}}
-    if kind == "voice":
-        voice = {k: spec[k] for k in ("encode_type", "sample_rate", "playtime", "bits_per_sample")
-                 if spec.get(k) is not None}
-        voice["media"] = media
-        return {"type": OUTGOING_ITEM_TYPE["voice"], "voice_item": voice}
     return {"type": OUTGOING_ITEM_TYPE["file"],
             "file_item": {"media": media,
                           "file_name": sanitize_filename(os.path.basename(file_path)),

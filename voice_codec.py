@@ -1,4 +1,4 @@
-"""MP3 -> mono PCM -> Tencent SILK, with bounded workers and a reusable local cache."""
+"""Audio file preparation. SILK encoding is retained locally; bot replies use files."""
 import hashlib
 import io
 import json
@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import wave
 
 from runtime_io import atomic_write_json, private_directory, private_file
 
@@ -177,11 +178,123 @@ def prepare_mp3(source, cache_directory):
             "playtime": metadata["playtime"]}
 
 
+def _wav_info(path):
+    with wave.open(path, "rb") as audio:
+        if (audio.getnchannels(), audio.getsampwidth(), audio.getframerate()) != (1, 2, SAMPLE_RATE):
+            raise VoiceConversionError("Invalid decoded WAV format")
+        frames = audio.getnframes()
+        if not 0 < frames <= SAMPLE_RATE * MAX_SECONDS:
+            raise VoiceConversionError("Decoded audio is empty or exceeds the local 60-second limit")
+        if len(audio.readframes(frames)) != frames * 2:
+            raise VoiceConversionError("Decoded WAV is truncated")
+    return {"playtime": (frames * 1000 + SAMPLE_RATE - 1) // SAMPLE_RATE,
+            "sample_rate": SAMPLE_RATE, "bits_per_sample": 16}
+
+
+def _decode_silk(source, output):
+    try:
+        import pysilk
+        if not callable(getattr(pysilk, "decode", None)):
+            raise ImportError("missing decoder")
+    except ImportError:
+        raise VoiceConversionError("SILK decoder unavailable; install silk-python==0.2.8") from None
+
+    class LimitedPCM(io.BytesIO):
+        def write(self, data):
+            if self.tell() + len(data) > SAMPLE_RATE * 2 * MAX_SECONDS:
+                raise VoiceConversionError("SILK exceeds the local 60-second conversion limit")
+            return super().write(data)
+
+    pcm = LimitedPCM()
+    try:
+        with open(source, "rb") as stream:
+            pysilk.decode(stream, pcm, SAMPLE_RATE)
+    except Exception:
+        raise VoiceConversionError("SILK decoding failed or exceeds the local 60-second limit") from None
+    if not pcm.getvalue():
+        raise VoiceConversionError("SILK decoding produced empty audio")
+    with open(output, "wb") as stream:
+        private_file(output)
+        with wave.open(stream, "wb") as audio:
+            audio.setnchannels(1)
+            audio.setsampwidth(2)
+            audio.setframerate(SAMPLE_RATE)
+            audio.writeframes(pcm.getvalue())
+        stream.flush()
+        os.fsync(stream.fileno())
+    return _wav_info(output)
+
+
+def prepare_audio_file(source, cache_directory, original_source=None):
+    """Return FILE media only: MP3/WAV pass through, old SILK is decoded to WAV."""
+    if original_source and os.path.splitext(original_source)[1].lower() == ".mp3" and os.path.isfile(original_source):
+        source = original_source  # Prefer the original TTS MP3 over an older converted SILK.
+    source = os.path.abspath(source)
+    extension = os.path.splitext(source)[1].lower()
+    if extension not in (".mp3", ".wav", ".silk", ".sil"):
+        raise VoiceConversionError("Audio replies require MP3, WAV or SILK input")
+    if not os.path.isfile(source) or not 0 < os.path.getsize(source) <= MAX_SOURCE_BYTES:
+        raise VoiceConversionError("Audio source must exist, be nonempty and no larger than 25 MiB")
+    if extension in (".mp3", ".wav"):
+        return {"kind": "file", "path": source, "audio_reply": True}
+    with open(source, "rb") as stream:
+        raw = stream.read(MAX_SOURCE_BYTES + 1)
+    if len(raw) > MAX_SOURCE_BYTES:
+        raise VoiceConversionError("SILK source exceeds 25 MiB")
+    digest = hashlib.sha256(b"wechat-audio-file:24000:mono:wav:v1\0" + raw).hexdigest()
+    private_directory(cache_directory)
+    path = os.path.abspath(os.path.join(cache_directory, digest + ".wav"))
+    metadata_path = path + ".json"
+    try:
+        with open(metadata_path, encoding="utf-8") as stream:
+            metadata = json.load(stream)
+        with open(path, "rb") as stream:
+            checksum = hashlib.sha256(stream.read(MAX_SOURCE_BYTES + 1)).hexdigest()
+        if metadata.get("wav_sha256") != checksum or metadata.get("version") != CACHE_VERSION:
+            raise VoiceConversionError("Invalid WAV cache")
+        _wav_info(path)
+    except (OSError, ValueError, EOFError, wave.Error, AttributeError):
+        temporary = tempfile.mkdtemp(prefix=".audio-", dir=os.path.abspath(cache_directory))
+        private_directory(temporary)
+        snapshot, decoded = os.path.join(temporary, "input.silk"), os.path.join(temporary, "output.wav")
+        try:
+            with open(snapshot, "wb") as stream:
+                private_file(snapshot)
+                stream.write(raw)
+            try:
+                result = subprocess.run(
+                    [sys.executable, "-B", os.path.abspath(__file__), "--decode-worker", snapshot, decoded],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=WORKER_TIMEOUT,
+                    check=False, **_process_options())
+            except subprocess.TimeoutExpired:
+                raise VoiceConversionError("SILK to WAV conversion timed out") from None
+            try:
+                metadata = json.loads(result.stdout.decode("utf-8"))
+            except (ValueError, UnicodeError):
+                raise VoiceConversionError("SILK to WAV conversion worker failed") from None
+            if not isinstance(metadata, dict) or result.returncode:
+                raise VoiceConversionError(metadata.get("error", "SILK to WAV conversion failed")
+                                           if isinstance(metadata, dict) else "Invalid conversion result")
+            info = _wav_info(decoded)
+            with open(decoded, "rb") as stream:
+                checksum = hashlib.sha256(stream.read(MAX_SOURCE_BYTES + 1)).hexdigest()
+            os.replace(decoded, path)
+            atomic_write_json(metadata_path, dict(info, wav_sha256=checksum, version=CACHE_VERSION))
+        finally:
+            for filename in (snapshot, decoded):
+                if os.path.isfile(filename):
+                    os.remove(filename)
+            os.rmdir(temporary)
+    private_file(path)
+    return {"kind": "file", "path": path, "source_path": source, "audio_reply": True}
+
+
 if __name__ == "__main__":
-    if len(sys.argv) != 4 or sys.argv[1] != "--worker":
+    if len(sys.argv) != 4 or sys.argv[1] not in ("--worker", "--decode-worker"):
         sys.exit("Internal conversion worker; use bridge.py send-voice")
     try:
-        print(json.dumps(_encode_mp3(sys.argv[2], sys.argv[3])))
+        converter = _decode_silk if sys.argv[1] == "--decode-worker" else _encode_mp3
+        print(json.dumps(converter(sys.argv[2], sys.argv[3])))
     except VoiceConversionError as error:
         print(json.dumps({"error": str(error)}))
         sys.exit(1)

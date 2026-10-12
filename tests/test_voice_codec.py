@@ -6,6 +6,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 import unittest
+import wave
 from unittest.mock import patch
 
 import pysilk
@@ -49,6 +50,30 @@ class VoiceCodecTests(unittest.TestCase):
             worker.assert_called_once()
         self.assertEqual(rebuilt["playtime"], result["playtime"])
         self.assertEqual(list(self.cache.glob(".voice-*")), [])
+        # Production delivery decodes existing SILK to a standard WAV FILE card.
+        wav_cache = self.root / "audio-cache"
+        audio_file = voice_codec.prepare_audio_file(result["path"], str(wav_cache))
+        self.assertEqual(audio_file["kind"], "file")
+        self.assertTrue(audio_file["path"].endswith(".wav"))
+        with wave.open(audio_file["path"], "rb") as wav:
+            self.assertEqual((wav.getnchannels(), wav.getsampwidth(), wav.getframerate()), (1, 2, 24000))
+            self.assertEqual(wav.getnframes(), 24000 * result["playtime"] // 1000)
+            self.assertNotEqual(wav.readframes(wav.getnframes()), b"\0" * (wav.getnframes() * 2))
+        with patch.object(voice_codec.subprocess, "run", side_effect=AssertionError("WAV cache should avoid decoding")):
+            self.assertEqual(voice_codec.prepare_audio_file(result["path"], str(wav_cache)), audio_file)
+
+    def test_audio_files_pass_through_without_codec_and_old_silk_prefers_original_mp3(self):
+        for extension in (".mp3", ".wav"):
+            source = self.root / ("reply" + extension)
+            source.write_bytes(b"file content")
+            with patch.object(voice_codec.subprocess, "run", side_effect=AssertionError("no conversion needed")):
+                result = voice_codec.prepare_audio_file(str(source), str(self.cache))
+            self.assertEqual(result["kind"], "file")
+            self.assertEqual(result["path"], str(source))
+        original = self.root / "reply.mp3"
+        recovered = voice_codec.prepare_audio_file(str(self.root / "old.silk"), str(self.cache), str(original))
+        self.assertEqual(recovered["path"], str(original))
+        self.assertFalse(self.cache.exists())
 
     def test_invalid_mp3_fails_without_publishing_silk(self):
         source = self.root / "invalid.mp3"
