@@ -26,9 +26,9 @@ ITEM_KIND = {2: "image", 3: "voice", 4: "file", 5: "video"}
 UPLOAD_MEDIA_TYPE = {"image": 1, "video": 2, "file": 3, "voice": 4}
 OUTGOING_ITEM_TYPE = {"image": 2, "voice": 3, "file": 4, "video": 5}
 VOICE_EXTENSIONS = {
-    1: (".pcm",), 2: (".adpcm",), 3: (".dat",), 4: (".spx", ".speex"),
-    5: (".amr",), 6: (".silk", ".sil"), 7: (".mp3",), 8: (".ogg", ".spx"),
+    6: (".silk", ".sil"),
 }
+SILK_HEADERS = (b"#!SILK_V3", b"\x02#!SILK_V3")
 METADATA_FIELDS = {
     "image": ("mid_size", "hd_size", "thumb_size", "thumb_width", "thumb_height"),
     "voice": ("encode_type", "bits_per_sample", "sample_rate", "playtime"),
@@ -217,7 +217,25 @@ def download_message_attachments(session, msg, directory, prefix):
     return attachments
 
 
-def validate_media_spec(spec):
+def _validate_silk_header(header, size):
+    prefix = next((p for p in SILK_HEADERS if header.startswith(p)), None)
+    if prefix is None or size <= len(prefix) + (1 if header[len(prefix):len(prefix) + 1] == b"\n" else 0):
+        raise ValueError("send-voice requires SILK V3 audio; transcode MP3/WAV externally or use send-file")
+
+
+def validate_silk_file(path):
+    """Check the actual signature, not just the extension; no transcoding is performed."""
+    if not os.path.isfile(path):
+        raise ValueError("voice file does not exist")
+    size = os.path.getsize(path)
+    if size > MAX_MEDIA_BYTES:
+        raise ValueError("file too large (>25MB)")
+    with open(path, "rb") as stream:
+        header = stream.read(32)
+    _validate_silk_header(header, size)
+
+
+def validate_media_spec(spec, check_file=False):
     if not isinstance(spec, dict) or spec.get("kind") not in OUTGOING_ITEM_TYPE:
         raise ValueError("kind must be image, file, video or voice")
     if not isinstance(spec.get("path"), str) or not spec["path"]:
@@ -225,17 +243,17 @@ def validate_media_spec(spec):
     if spec["kind"] == "voice":
         encoding = spec.get("encode_type")
         if type(encoding) is not int or encoding not in VOICE_EXTENSIONS:
-            raise ValueError("voice encode_type must be an explicit integer from 1 to 8")
+            raise ValueError("send-voice only supports SILK (encode_type=6); use send-file for MP3/WAV")
         for field in ("sample_rate", "playtime"):
             if type(spec.get(field)) is not int or spec[field] <= 0:
                 raise ValueError("voice %s must be a positive integer" % field)
         bits = spec.get("bits_per_sample")
         if bits is not None and (type(bits) is not int or not 1 <= bits <= 64):
             raise ValueError("voice bits_per_sample must be an integer from 1 to 64")
-        if encoding == 1 and bits is None:
-            raise ValueError("PCM voice requires bits_per_sample")
         if os.path.splitext(spec["path"])[1].lower() not in VOICE_EXTENSIONS[encoding]:
             raise ValueError("voice file extension does not match encode_type; transcode first")
+        if check_file:
+            validate_silk_file(spec["path"])
     if spec["kind"] == "video" and os.path.splitext(spec["path"])[1].lower() != ".mp4":
         raise ValueError("video currently requires an MP4 file")
 
@@ -296,8 +314,8 @@ def upload_media(api_post, session, to_user_id, file_path, kind, options=None):
         raise ValueError("file too large (>25MB)")
     if kind == "video" and sniff_mime(raw) != "video/mp4":
         raise ValueError("video file does not have an MP4 header")
-    if kind == "voice" and not raw:
-        raise ValueError("voice file is empty")
+    if kind == "voice":
+        _validate_silk_header(raw[:32], len(raw))
     key = os.urandom(16)
     key_hex = key.hex()
     enc = aes_ecb_encrypt(raw, key)

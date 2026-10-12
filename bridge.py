@@ -485,6 +485,80 @@ def extract_text_and_media(msg):
     return "\n".join(texts).strip(), has_media
 
 
+def server_message_id(value):
+    """Keep uint64 IDs lossless; never infer an ID from timestamps or sequence numbers."""
+    if isinstance(value, str):
+        return value.strip() or None
+    if type(value) is int and value >= 0:
+        return str(value)
+    return None
+
+
+def cached_attachments(attachments):
+    """Recheck cached files: cleanup may have removed media belonging to an old message."""
+    result = []
+    for original in attachments or []:
+        item = dict(original)
+        for part in (item, item.get("thumbnail")):
+            if not isinstance(part, dict):
+                continue
+            if part is not item:
+                item["thumbnail"] = part = dict(part)
+            if part.get("path") and not os.path.isfile(part["path"]):
+                part.update(path=None, ok=False, error="cached attachment no longer available")
+        result.append(item)
+    return result
+
+
+def find_cached_reference(message_id, session):
+    """Resolve only exact server/item IDs in this account and peer's persisted records."""
+    candidates = []
+    for directory, inbound in ((INBOX, True), (OUTBOX, False)):
+        if not os.path.isdir(directory):
+            continue
+        for name in os.listdir(directory):
+            if not name.endswith(".json"):
+                continue
+            try:
+                with open(os.path.join(directory, name), encoding="utf-8") as stream:
+                    record = json.load(stream)
+                if not isinstance(record, dict) or not belongs_to_session(record, session, inbound=inbound):
+                    continue
+                if inbound:
+                    if server_message_id(record.get("message_id")) == message_id:
+                        candidates.append(record)
+                    else:
+                        candidates.extend(item for item in record.get("item_messages", [])
+                                          if server_message_id(item.get("msg_id")) == message_id)
+                else:
+                    for part in record.get("delivery") or []:
+                        if not part.get("sent") or server_message_id(part.get("message_id")) != message_id:
+                            continue
+                        text, has_media = extract_text_and_media({"item_list": part.get("item_list") or []})
+                        attachments = []
+                        spec = record.get("media")
+                        if has_media and spec:
+                            path = spec["path"]
+                            attachments.append({"kind": spec["kind"], "path": path, "ok": True,
+                                                "mime": media_mod.MIME_BY_EXT.get(os.path.splitext(path)[1].lower()),
+                                                "error": None, "metadata": {
+                                                    k: spec[k] for k in media_mod.METADATA_FIELDS[spec["kind"]]
+                                                    if k in spec}})
+                        candidates.append({"text": text, "has_media": has_media, "attachments": attachments})
+            except (OSError, ValueError, KeyError, TypeError, AttributeError):
+                continue
+    # Conflicting local records are not a basis for guessing which message was quoted.
+    matches = {}
+    for candidate in candidates:
+        try:
+            value = {"text": candidate.get("text") or "", "has_media": bool(candidate.get("has_media")),
+                     "attachments": cached_attachments(candidate.get("attachments"))}
+            matches[json.dumps(value, sort_keys=True, ensure_ascii=False)] = value
+        except (OSError, TypeError, ValueError):
+            continue
+    return next(iter(matches.values())) if len(matches) == 1 else None
+
+
 def extract_references(msg, session, directory, prefix, depth=0):
     """Keep quoted context separate from the user's current instruction (max 3 levels)."""
     if depth >= 3:
@@ -497,13 +571,24 @@ def extract_references(msg, session, directory, prefix, depth=0):
         quoted = ref.get("message_item")
         content = {"item_list": [quoted]} if isinstance(quoted, dict) else {"item_list": []}
         text, has_media = extract_text_and_media(content)
+        quoted_id = server_message_id(quoted.get("msg_id")) if isinstance(quoted, dict) else None
+        reference_id = server_message_id(ref.get("svr_id")) or quoted_id
         key = "%s_ref-%d" % (prefix, index)
         record = {
             "item_index": index, "text": text, "has_media": has_media,
-            "content_available": isinstance(quoted, dict) and bool(quoted),
+            "content_available": bool(text or has_media),
+            "resolution": "inline" if text or has_media else "missing",
             "attachments": media_mod.download_message_attachments(session, content, directory, key),
             "references": extract_references(content, session, directory, key, depth + 1),
         }
+        if quoted_id:
+            record["msg_id"] = quoted_id
+        if reference_id:
+            record["reference_id"] = reference_id
+            if not record["content_available"]:
+                cached = find_cached_reference(reference_id, session)
+                if cached is not None and (cached["text"] or cached["has_media"]):
+                    record.update(cached, content_available=True, resolution="local_history")
         for field in ("title", "svr_id"):
             if isinstance(ref.get(field), str):
                 record[field] = ref[field]
@@ -634,6 +719,14 @@ def _poll_locked(args):
         }
         directory = os.path.join(ROOT, "media", time.strftime("%Y-%m-%d"))
         rec["attachments"] = media_mod.download_message_attachments(sess, m, directory, key)
+        rec["item_messages"] = []
+        for index, item in enumerate(m.get("item_list") or []):
+            item_id = server_message_id(item.get("msg_id")) if isinstance(item, dict) else None
+            if item_id:
+                item_text, item_has_media = extract_text_and_media({"item_list": [item]})
+                rec["item_messages"].append({
+                    "msg_id": item_id, "text": item_text, "has_media": item_has_media,
+                    "attachments": [a for a in rec["attachments"] if a.get("index") == index]})
         rec["references"] = extract_references(m, sess, directory, key)
         atomic_write_json(ipath, rec)
         added += 1
@@ -785,10 +878,23 @@ def _send_locked(args):
                     continue
                 if time.time() < pause_until():
                     raise RuntimeError("PAUSED_1H")
+                if part["kind"] == "media" and o["media"]["kind"] == "voice":
+                    media_mod.validate_media_spec(o["media"])
+                    # Older pending uploads may already contain an unplayable MP3 item.
+                    if part["item_list"] is not None:
+                        if any(item.get("type") != 3 or
+                               (item.get("voice_item") or {}).get("encode_type") != 6
+                               for item in part["item_list"]):
+                            raise ValueError("cached voice upload is not SILK; queue a new SILK reply")
+                        if not part.get("silk_validated"):
+                            media_mod.validate_silk_file(o["media"]["path"])
+                            part["silk_validated"] = True
                 if part["item_list"] is None:
                     spec = o["media"]
                     part["item_list"] = [media_mod.upload_media(
                         http_post, sess, o["to_user_id"], spec["path"], spec["kind"], options=spec)]
+                    if spec["kind"] == "voice":
+                        part["silk_validated"] = True
                     _write_outbox(p, o)
                 body = {
                     "msg": {
@@ -814,6 +920,9 @@ def _send_locked(args):
                     raise RuntimeError("PAUSED_1H")
                 if ret not in (None, 0):
                     raise RuntimeError("business: ret=%s" % ret)
+                response_id = server_message_id((resp or {}).get("message_id"))
+                if response_id:
+                    part["message_id"] = response_id
                 part["sent"] = True
                 _write_outbox(p, o)
 
@@ -879,7 +988,7 @@ def _queue_reply_locked(reply_to, to_user_id, context_token, text, media=None):
     if os.path.exists(p):
         return p  # already queued/sent; never duplicate
     if media is not None:
-        media_mod.validate_media_spec(media)
+        media_mod.validate_media_spec(media, check_file=True)
     _write_outbox(p, {
         "reply_to": reply_to,
         "account_id": account_id(sess),
@@ -1009,7 +1118,7 @@ def cmd_send_media(args):
             if value is not None:
                 spec[field] = value
     try:
-        media_mod.validate_media_spec(spec)
+        media_mod.validate_media_spec(spec, check_file=args.kind == "voice")
     except ValueError as error:
         print(json.dumps({"ok": False, "error": "INVALID_MEDIA", "hint": str(error)}, ensure_ascii=False))
         return 1
@@ -1184,13 +1293,13 @@ def main():
     video.add_argument("path")
     video.add_argument("--text", default="")
 
-    voice = sub.add_parser("send-voice", help="experimental: queue already encoded audio")
+    voice = sub.add_parser("send-voice", help="experimental: queue SILK V3 audio (no transcoding)")
     voice.add_argument("path")
     voice.add_argument("--text", default="")
-    voice.add_argument("--encode-type", type=int, choices=range(1, 9), required=True)
+    voice.add_argument("--encode-type", type=int, choices=[6], default=6, help="SILK only (default: 6)")
     voice.add_argument("--sample-rate", type=int, required=True, help="Hz")
     voice.add_argument("--playtime", type=int, required=True, help="duration in milliseconds")
-    voice.add_argument("--bits-per-sample", type=int, default=None, help="required for PCM")
+    voice.add_argument("--bits-per-sample", type=int, default=None, help="optional source bit depth")
 
     cc = sub.add_parser("cleanup")
     cc.add_argument("--days", type=int, default=30)

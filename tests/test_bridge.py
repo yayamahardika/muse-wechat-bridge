@@ -197,6 +197,91 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(ref["text"], "")
         self.assertEqual(ref["title"], "摘要")
 
+    def test_real_device_reference_stub_preserves_id_without_inventing_content(self):
+        message = self.message(number=10)
+        message.pop("message_id")
+        message.update(root_id=0, parent_id=0)
+        message["item_list"] = [{"type": 1, "is_completed": True,
+            "text_item": {"text": "测试引用"}, "ref_msg": {"message_item": {
+                "type": 0, "is_completed": True, "msg_id": "7515306531200413704"}}}]
+        self.poll([message])
+        record = json.loads(Path(bridge.INBOX, "10_None.json").read_text(encoding="utf-8"))
+        self.assertEqual(len(record["references"]), 1)
+        ref = record["references"][0]
+        self.assertEqual(ref["msg_id"], "7515306531200413704")
+        self.assertEqual(ref["reference_id"], "7515306531200413704")
+        self.assertFalse(ref["content_available"])
+        self.assertEqual(ref["resolution"], "missing")
+        self.assertEqual(ref["text"], "")
+
+    def test_server_reply_id_is_persisted_and_resolves_real_device_reference_stub(self):
+        self.queue()
+        message_id = "7515306531200413704"
+        with patch.object(bridge, "http_post", return_value=({"ret": 0, "message_id": message_id}, None)):
+            bridge.cmd_send(self.args)
+        self.assertEqual(self.read_reply()["delivery"][0]["message_id"], message_id)
+        message = self.message(number=2)
+        message["item_list"][0]["ref_msg"] = {"message_item": {
+            "type": 0, "is_completed": True, "msg_id": message_id}}
+        self.poll([message])
+        record = json.loads(Path(bridge.INBOX, "2_2.json").read_text(encoding="utf-8"))
+        ref = record["references"][0]
+        self.assertTrue(ref["content_available"])
+        self.assertEqual(ref["resolution"], "local_history")
+        self.assertEqual(ref["text"], "caption")
+        self.assertEqual(record["text"], "task")
+
+    def test_id_only_quote_resolves_exact_inbound_item_without_neighboring_text(self):
+        original = self.message()
+        original["item_list"] = [
+            {"type": 1, "msg_id": "7515306531200413704", "text_item": {"text": "被引用的文字"}},
+            {"type": 1, "msg_id": "7515306531200413705", "text_item": {"text": "另一条内容"}}]
+        self.poll([original])
+        current = self.message(number=2)
+        current["item_list"][0]["ref_msg"] = {"message_item": {
+            "type": 0, "msg_id": "7515306531200413704"}}
+        self.poll([current])
+        record = json.loads(Path(bridge.INBOX, "2_2.json").read_text(encoding="utf-8"))
+        self.assertEqual(record["references"][0]["text"], "被引用的文字")
+
+    def test_cached_quote_never_uses_other_account_or_peer(self):
+        message_id = "7515306531200413704"
+        for name, fields in [
+                ("other-account", {"account_id": "old-account", "from_user_id": "owner"}),
+                ("other-peer", {"account_id": bridge.account_id(self.session), "from_user_id": "stranger"})]:
+            record = dict(fields, to_user_id="bot", message_id=message_id,
+                          text="private content", has_media=False, attachments=[])
+            runtime_io.atomic_write_json(os.path.join(bridge.INBOX, name + ".json"), record)
+        self.assertIsNone(bridge.find_cached_reference(message_id, self.session))
+
+    def test_conflicting_cached_ids_are_not_resolved_by_timestamp(self):
+        first = self.message()
+        second = self.message(number=2)
+        second["message_id"] = first["message_id"]
+        second["create_time_ms"] = first["create_time_ms"]
+        second["item_list"][0]["text_item"]["text"] = "conflicting content"
+        self.poll([first, second])
+        self.assertIsNone(bridge.find_cached_reference("1", self.session))
+        self.assertIsNone(bridge.find_cached_reference("unknown", self.session))
+
+    def test_media_reply_id_resolves_media_separately_from_caption_and_checks_expiry(self):
+        path = Path(self.temp.name, "image.png")
+        path.write_bytes(b"image")
+        self.queue(media_spec={"kind": "image", "path": str(path)})
+        with patch.object(media, "upload_media", return_value={"type": 2}), \
+                patch.object(bridge, "http_post", side_effect=[
+                    ({"ret": 0, "message_id": "image-id"}, None),
+                    ({"ret": 0, "message_id": "caption-id"}, None)]):
+            bridge.cmd_send(self.args)
+        image = bridge.find_cached_reference("image-id", self.session)
+        self.assertEqual(image["text"], "")
+        self.assertTrue(image["attachments"][0]["ok"])
+        self.assertEqual(bridge.find_cached_reference("caption-id", self.session)["text"], "caption")
+        path.unlink()
+        expired = bridge.find_cached_reference("image-id", self.session)
+        self.assertFalse(expired["attachments"][0]["ok"])
+        self.assertIsNone(expired["attachments"][0]["path"])
+
     def test_quoted_voice_transcript_and_media_are_available(self):
         message = self.message()
         message["item_list"][0]["ref_msg"] = {"message_item": {
@@ -280,7 +365,7 @@ class BridgeTests(unittest.TestCase):
     def test_video_and_voice_upload_build_expected_protocol_items(self):
         for kind, ext, raw, options, upload_type, item_type in [
                 ("video", ".mp4", b"\x00\x00\x00\x18ftypmp42test", {}, 2, 5),
-                ("voice", ".mp3", b"ID3test-audio", {"encode_type": 7, "sample_rate": 24000, "playtime": 1500}, 4, 3)]:
+                ("voice", ".silk", b"#!SILK_V3\n\x05\x00abcde", {"encode_type": 6, "sample_rate": 24000, "playtime": 1500}, 4, 3)]:
             with self.subTest(kind=kind):
                 path = str(Path(self.temp.name, "sample" + ext))
                 Path(path).write_bytes(raw)
@@ -301,16 +386,17 @@ class BridgeTests(unittest.TestCase):
                 if kind == "video":
                     self.assertEqual(item["video_item"]["video_size"], len(encrypted))
                 else:
-                    self.assertEqual(item["voice_item"]["encode_type"], 7)
+                    self.assertEqual(item["voice_item"]["encode_type"], 6)
                     self.assertEqual(item["voice_item"]["playtime"], 1500)
                     self.assertEqual(item["voice_item"]["sample_rate"], 24000)
 
     def test_invalid_voice_spec_is_rejected_before_queue_or_network(self):
-        base = {"kind": "voice", "path": "sample.mp3", "encode_type": 7,
+        base = {"kind": "voice", "path": "sample.silk", "encode_type": 6,
                 "sample_rate": 24000, "playtime": 1000}
         for changes in ({"encode_type": 99}, {"encode_type": True}, {"playtime": 0},
                         {"sample_rate": None}, {"path": "sample.wav"}, {"bits_per_sample": -1},
-                        {"encode_type": 1, "path": "sample.pcm"}):
+                        {"encode_type": 1, "path": "sample.pcm"},
+                        {"encode_type": 7, "path": "sample.mp3"}):
             with self.subTest(changes=changes), self.assertRaises(ValueError):
                 self.queue(media_spec=dict(base, **changes))
         self.assertEqual(os.listdir(bridge.OUTBOX), [])
@@ -318,7 +404,7 @@ class BridgeTests(unittest.TestCase):
     def test_invalid_video_or_empty_voice_never_requests_upload(self):
         for kind, name, raw, options in [
                 ("video", "fake.mp4", b"not a video", {}),
-                ("voice", "empty.mp3", b"", {"encode_type": 7, "sample_rate": 24000, "playtime": 1000})]:
+                ("voice", "empty.silk", b"", {"encode_type": 6, "sample_rate": 24000, "playtime": 1000})]:
             path = str(Path(self.temp.name, name))
             Path(path).write_bytes(raw)
             with self.subTest(kind=kind), patch.object(bridge, "http_post") as api:
@@ -326,14 +412,55 @@ class BridgeTests(unittest.TestCase):
                     media.upload_media(api, self.session, "owner", path, kind, options=options)
                 api.assert_not_called()
 
+    def test_mp3_renamed_to_silk_is_rejected_before_queue_and_upload(self):
+        path = Path(self.temp.name, "disguised.silk")
+        path.write_bytes(b"ID3test-audio")
+        spec = {"kind": "voice", "path": str(path), "encode_type": 6,
+                "sample_rate": 24000, "playtime": 1500}
+        with self.assertRaisesRegex(ValueError, "SILK"):
+            self.queue(media_spec=spec)
+        with patch.object(bridge, "http_post") as api:
+            with self.assertRaisesRegex(ValueError, "SILK"):
+                media.upload_media(api, self.session, "owner", str(path), "voice", options=spec)
+            api.assert_not_called()
+        self.assertEqual(os.listdir(bridge.OUTBOX), [])
+
+    def test_silk_header_with_and_without_tencent_prefix_is_accepted(self):
+        for prefix in (b"", b"\x02"):
+            path = Path(self.temp.name, "sample.silk")
+            path.write_bytes(prefix + b"#!SILK_V3\n\x05\x00abcde")
+            media.validate_silk_file(str(path))
+        path.write_bytes(b"#!SILK_V3\n")
+        with self.assertRaises(ValueError):
+            media.validate_silk_file(str(path))
+
+    def test_old_pending_cached_mp3_voice_is_not_sent(self):
+        record = {"reply_to": "legacy-voice", "to_user_id": "owner", "text": "", "status": "pending",
+                  "account_id": bridge.account_id(self.session), "context_token": "test-context",
+                  "media": {"kind": "voice", "path": "old.mp3", "encode_type": 7,
+                            "sample_rate": 24000, "playtime": 1500},
+                  "delivery": [{"kind": "media", "sent": False, "client_id": "stable-id",
+                                "item_list": [{"type": 3, "voice_item": {"encode_type": 7}}]}]}
+        bridge._write_outbox(bridge.outbox_path("legacy-voice"), record)
+        with patch.object(bridge, "http_post") as api:
+            bridge.cmd_send(self.args)
+            api.assert_not_called()
+        self.assertIn("SILK", self.read_reply("legacy-voice")["last_error"])
+
     def test_video_and_voice_send_retries_reuse_upload_and_client_id(self):
         for kind, ext, item_type, options in [
                 ("video", ".mp4", 5, {}),
-                ("voice", ".mp3", 3, {"encode_type": 7, "sample_rate": 24000, "playtime": 1000})]:
-            spec = dict(options, kind=kind, path="unused" + ext)
+                ("voice", ".silk", 3, {"encode_type": 6, "sample_rate": 24000, "playtime": 1000})]:
+            path = str(Path(self.temp.name, "reply" + ext))
+            if kind == "voice":
+                Path(path).write_bytes(b"#!SILK_V3\n\x05\x00abcde")
+            spec = dict(options, kind=kind, path=path)
             bridge.queue_reply(kind, "owner", "test-context", "", spec)
+            uploaded = {"type": item_type}
+            if kind == "voice":
+                uploaded["voice_item"] = {"encode_type": 6}
             with self.subTest(kind=kind), \
-                    patch.object(media, "upload_media", return_value={"type": item_type}) as upload, \
+                    patch.object(media, "upload_media", return_value=uploaded) as upload, \
                     patch.object(bridge, "http_post", side_effect=[(None, "timeout"), ({"ret": 0}, None)]) as post:
                 bridge.cmd_send(self.args)
                 bridge.cmd_send(self.args)
@@ -346,29 +473,29 @@ class BridgeTests(unittest.TestCase):
 
     def test_send_voice_command_preserves_options_in_queue(self):
         self.poll([self.message()])
-        path = Path(self.temp.name, "reply.mp3")
-        path.write_bytes(b"ID3sample")
-        args = SimpleNamespace(kind="voice", path=str(path), text="语音回复", encode_type=7,
+        path = Path(self.temp.name, "reply.silk")
+        path.write_bytes(b"#!SILK_V3\n\x05\x00abcde")
+        args = SimpleNamespace(kind="voice", path=str(path), text="语音回复", encode_type=6,
                                sample_rate=24000, playtime=1000, bits_per_sample=None)
         self.assertEqual(bridge.cmd_send_media(args), 0)
         record = json.loads(next(Path(bridge.OUTBOX).glob("*.json")).read_text(encoding="utf-8"))
-        self.assertEqual(record["media"]["encode_type"], 7)
+        self.assertEqual(record["media"]["encode_type"], 6)
         self.assertEqual(record["text"], "语音回复")
         self.assertEqual(record["media"]["path"], str(path))
 
     def test_media_cli_dispatches_video_and_voice_with_explicit_parameters(self):
         for command, options, kind in [
                 ("send-video", [], "video"),
-                ("send-voice", ["--encode-type", "7", "--sample-rate", "24000",
+                ("send-voice", ["--sample-rate", "24000",
                                 "--playtime", "1500"], "voice")]:
             with self.subTest(command=command), patch.object(sys, "argv", [
-                    "bridge.py", command, "sample.mp3" if kind == "voice" else "sample.mp4"] + options), \
+                    "bridge.py", command, "sample.silk" if kind == "voice" else "sample.mp4"] + options), \
                     patch.object(bridge, "cmd_send_media", return_value=0) as send:
                 self.assertEqual(bridge.main(), 0)
                 args = send.call_args.args[0]
                 self.assertEqual(args.kind, kind)
                 if kind == "voice":
-                    self.assertEqual((args.encode_type, args.sample_rate, args.playtime), (7, 24000, 1500))
+                    self.assertEqual((args.encode_type, args.sample_rate, args.playtime), (6, 24000, 1500))
 
     def test_cursor_survives_failed_inbox_write(self):
         bridge.save_cursor("old")
