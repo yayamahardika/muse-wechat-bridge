@@ -29,7 +29,7 @@
 ```text
 请帮我部署 wechat-bridge（微信 ↔ Muse 双向桥），让它能收微信消息、执行任务并回微信。
 
-【项目】https://github.com/yayamahardika/wechat-bridge
+【项目】https://github.com/yayamahardika/muse-wechat-bridge
 （如果是 fork 或你自己的仓库地址，换成实际地址）
 
 【你要做的事，按顺序来】
