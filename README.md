@@ -1,4 +1,4 @@
-# WeChat Bridge
+# Muse WeChat Bridge
 
 基于腾讯 iLink ClawBot 协议的微信消息桥接工具，用于连接微信私聊与 Muse 等外部任务执行者。
 
