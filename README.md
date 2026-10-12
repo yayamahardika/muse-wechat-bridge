@@ -16,6 +16,43 @@
 
 ## 快速开始
 
+### 给 Muse 的部署提示词
+
+把下面整段复制发给你的 Muse，它会带着你走完安装、扫码登录和调度配置：
+
+```text
+请帮我部署 wechat-bridge（微信 ↔ Muse 双向桥），让它能收微信消息、执行任务并回微信。
+
+【项目】https://github.com/yayamahardika/wechat-bridge
+（如果是 fork 或你自己的仓库地址，换成实际地址）
+
+【你要做的事，按顺序来】
+
+1. 获取代码：把仓库克隆到本地（或下载解压），记下项目根目录的绝对路径。
+
+2. 安装依赖：按 README「快速开始 → 1. 安装依赖」操作，建议用虚拟环境；
+   后续命令里的 `python` 都指装好依赖的那个解释器。
+
+3. 扫码登录：运行 `python bridge.py login`，把生成的 state/qr.png 展示给我看；
+   我扫码后，你运行 `python bridge.py wait-login` 等待确认（微信若要求验证码，
+   你问我要）；最后 `python bridge.py status` 确认 logged_in 为 true。
+
+4. 创建调度任务：在 Muse 里创建一个 cron 任务：
+   - 名称：wechat-bridge-tick，每分钟运行一次；
+   - 任务指令：直接使用本 README《执行者提示词》一节的全文，
+     把里面的工作目录换成第 1 步记下的实际项目路径。
+   如果你用的不是 Muse：用系统 cron / systemd timer / Windows 任务计划程序，
+   每分钟依次运行 `poll` →（你作为执行者处理 inbox 并用 queue_reply() 入队）→ `send`
+   也行，具体规则同样参考《执行者提示词》。
+
+5. 验证：任务建好后，用绑定微信给机器人发一条消息，一分钟内应收到你的回复；
+   再运行 `python bridge.py status`，确认 last_tick 在持续更新。
+
+【纪律】不要把 state/ 下的会话凭据写入聊天记录或代码仓库（.gitignore 已配好，
+不要动它）；所有"今天 / 昨天 / 几点"的判断一律按 Asia/Shanghai 来。
+```
+
+
 ### 1. 安装依赖
 
 准备 Python 3 和 pip，在项目根目录执行。建议使用虚拟环境。
@@ -126,42 +163,6 @@ bridge.queue_reply(
 在 Muse 环境中，可由名为 `wechat-bridge-tick` 的 cron 任务每分钟唤醒一次 agent run，在同一次 run 内完成拉取、执行、回复入队和发送。该调度任务需在 Muse 中另行配置，不属于本仓库的 Python 命令。
 
 此部署方式由 cron 唤醒 Muse，收发通过 iLink HTTP 接口完成。约一分钟的调度间隔会带来消息处理延迟；微信消息不会自动出现在 Muse App 聊天中。执行者的历史上下文、长任务分段回传和异常通知策略也需由外部系统实现。
-
-### 给 Muse 的部署提示词
-
-把下面整段复制发给你的 Muse，它会带着你走完安装、扫码登录和调度配置：
-
-```text
-请帮我部署 wechat-bridge（微信 ↔ Muse 双向桥），让它能收微信消息、执行任务并回微信。
-
-【项目】https://github.com/yayamahardika/wechat-bridge
-（如果是 fork 或你自己的仓库地址，换成实际地址）
-
-【你要做的事，按顺序来】
-
-1. 获取代码：把仓库克隆到本地（或下载解压），记下项目根目录的绝对路径。
-
-2. 安装依赖：按 README「快速开始 → 1. 安装依赖」操作，建议用虚拟环境；
-   后续命令里的 `python` 都指装好依赖的那个解释器。
-
-3. 扫码登录：运行 `python bridge.py login`，把生成的 state/qr.png 展示给我看；
-   我扫码后，你运行 `python bridge.py wait-login` 等待确认（微信若要求验证码，
-   你问我要）；最后 `python bridge.py status` 确认 logged_in 为 true。
-
-4. 创建调度任务：在 Muse 里创建一个 cron 任务：
-   - 名称：wechat-bridge-tick，每分钟运行一次；
-   - 任务指令：直接使用本 README《执行者提示词》一节的全文，
-     把里面的工作目录换成第 1 步记下的实际项目路径。
-   如果你用的不是 Muse：用系统 cron / systemd timer / Windows 任务计划程序，
-   每分钟依次运行 `poll` →（你作为执行者处理 inbox 并用 queue_reply() 入队）→ `send`
-   也行，具体规则同样参考《执行者提示词》。
-
-5. 验证：任务建好后，用绑定微信给机器人发一条消息，一分钟内应收到你的回复；
-   再运行 `python bridge.py status`，确认 last_tick 在持续更新。
-
-【纪律】不要把 state/ 下的会话凭据写入聊天记录或代码仓库（.gitignore 已配好，
-不要动它）；所有"今天 / 昨天 / 几点"的判断一律按 Asia/Shanghai 来。
-```
 
 ### 执行者提示词（Muse 调度任务用）
 
