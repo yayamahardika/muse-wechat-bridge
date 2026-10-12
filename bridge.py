@@ -471,6 +471,10 @@ def extract_text_and_media(msg):
                 texts.append(ti["text"])
         elif t in (2, 3, 4, 5):
             has_media = True
+            if t == 3:
+                voice_text = (item.get("voice_item") or {}).get("text")
+                if isinstance(voice_text, str) and voice_text.strip():
+                    texts.append(voice_text)
     return "\n".join(texts).strip(), has_media
 
 

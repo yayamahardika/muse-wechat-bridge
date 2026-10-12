@@ -66,6 +66,49 @@ class BridgeTests(unittest.TestCase):
     def queue(self, key="reply", media_spec=None):
         return bridge.queue_reply(key, "owner", "test-context", "caption", media_spec)
 
+    def test_voice_transcript_reaches_inbox_and_history_when_download_fails(self):
+        message = self.message()
+        message["item_list"] = [{"type": 3, "voice_item": {"text": "帮我查一下天气"}}]
+        with patch.object(media, "download_attachment", return_value=(False, "no download param")), \
+                patch.object(bridge, "log_history") as history:
+            self.poll([message])
+        record = json.loads(Path(bridge.INBOX, "1_1.json").read_text(encoding="utf-8"))
+        self.assertEqual(record["text"], "帮我查一下天气")
+        self.assertTrue(record["has_media"])
+        self.assertEqual(record["status"], "new")
+        self.assertEqual(record["context_token"], "test-context")
+        self.assertEqual(record["attachments"][0]["kind"], "voice")
+        self.assertFalse(record["attachments"][0]["ok"])
+        self.assertEqual(history.call_args.args[1], record["text"])
+
+    def test_voice_transcript_keeps_downloaded_audio_attachment(self):
+        message = self.message()
+        message["item_list"] = [{"type": 3, "voice_item": {
+            "text": "语音任务", "media": {"encrypt_query_param": "audio-ref"}}}]
+        with patch.object(media, "download_attachment", return_value=(True, "audio/silk")) as download:
+            self.poll([message])
+        record = json.loads(Path(bridge.INBOX, "1_1.json").read_text(encoding="utf-8"))
+        self.assertEqual(record["text"], "语音任务")
+        self.assertTrue(record["attachments"][0]["ok"])
+        self.assertEqual(record["attachments"][0]["path"], download.call_args.args[3])
+        self.assertEqual(download.call_args.args[1], {"encrypt_query_param": "audio-ref"})
+
+    def test_text_and_voice_transcripts_keep_item_order(self):
+        message = {"item_list": [
+            {"type": 1, "text_item": {"text": "先做这件事"}},
+            {"type": 3, "voice_item": {"text": "再做那件事"}},
+            {"type": 1, "text_item": {"text": "补充说明"}},
+            {"type": 3, "voice_item": {"text": "最后一步"}},
+        ]}
+        self.assertEqual(bridge.extract_text_and_media(message),
+                         ("先做这件事\n再做那件事\n补充说明\n最后一步", True))
+
+    def test_voice_without_usable_transcript_remains_media_only(self):
+        for voice in (None, {}, {"text": None}, {"text": ""}, {"text": "  \n "}, {"text": 42}):
+            with self.subTest(voice=voice):
+                message = {"item_list": [{"type": 3, "voice_item": voice}]}
+                self.assertEqual(bridge.extract_text_and_media(message), ("", True))
+
     def test_cursor_survives_failed_inbox_write(self):
         bridge.save_cursor("old")
         write = bridge.atomic_write_json
