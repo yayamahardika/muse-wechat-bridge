@@ -14,9 +14,11 @@ Subcommands:
   login       获取登录二维码（不轮询）
   wait-login  轮询二维码状态直到确认/过期
   poll        拉取新消息 -> inbox/，自动下载媒体附件（带锁，cron 调用）
-  send        发送 outbox/ 中待发送回复，支持文字/图片/文件（带锁，cron 调用）
+  send        发送 outbox/ 中待发送回复，支持文字/图片/文件/视频/语音（带锁）
   send-file   发送本地文件（需先有对方消息的 context）
   send-image  发送本地图片（需先有对方消息的 context）
+  send-video  发送本地 MP4 视频（需先有对方消息的 context）
+  send-voice  发送本地已编码语音（实验性，须指定编码/采样率/时长）
   mark        标记 inbox 消息状态（供执行者用）
   cleanup     清理 N 天前的收发记录与媒体（默认 30 天）
   serve       前台轮询循环（调试用；生产由 cron tick 驱动）
@@ -41,6 +43,7 @@ import urllib.error
 import uuid
 
 import media as media_mod
+import session_store
 from runtime_io import atomic_write_json, atomic_write_text, private_directory, private_file
 
 if os.name == "nt":
@@ -142,16 +145,17 @@ def session_path():
 
 
 def load_session():
-    p = session_path()
-    if not os.path.exists(p):
-        return None
-    private_file(p)
-    with open(p, "r", encoding="utf-8") as f:
-        return json.load(f)
+    with Locked("session.lock") as ok:
+        if not ok:
+            raise session_store.SessionEncryptionError("Session is busy; retry later")
+        return session_store.load(session_path())
 
 
 def save_session(sess):
-    atomic_write_json(session_path(), sess)
+    with Locked("session.lock") as ok:
+        if not ok:
+            raise session_store.SessionEncryptionError("Session is busy; retry later")
+        session_store.save(session_path(), sess)
 
 
 def valid_session(sess):
@@ -464,18 +468,67 @@ def extract_text_and_media(msg):
     texts = []
     has_media = False
     for item in msg.get("item_list", []) or []:
+        if not isinstance(item, dict):
+            continue
         t = item.get("type")
         if t == 1:
             ti = item.get("text_item") or {}
-            if ti.get("text"):
+            if isinstance(ti, dict) and isinstance(ti.get("text"), str) and ti["text"]:
                 texts.append(ti["text"])
         elif t in (2, 3, 4, 5):
             has_media = True
             if t == 3:
-                voice_text = (item.get("voice_item") or {}).get("text")
+                voice = item.get("voice_item") or {}
+                voice_text = voice.get("text") if isinstance(voice, dict) else None
                 if isinstance(voice_text, str) and voice_text.strip():
                     texts.append(voice_text)
     return "\n".join(texts).strip(), has_media
+
+
+def extract_references(msg, session, directory, prefix, depth=0):
+    """Keep quoted context separate from the user's current instruction (max 3 levels)."""
+    if depth >= 3:
+        return []
+    references = []
+    for index, item in enumerate(msg.get("item_list") or []):
+        ref = item.get("ref_msg") if isinstance(item, dict) else None
+        if not isinstance(ref, dict):
+            continue
+        quoted = ref.get("message_item")
+        content = {"item_list": [quoted]} if isinstance(quoted, dict) else {"item_list": []}
+        text, has_media = extract_text_and_media(content)
+        key = "%s_ref-%d" % (prefix, index)
+        record = {
+            "item_index": index, "text": text, "has_media": has_media,
+            "content_available": isinstance(quoted, dict) and bool(quoted),
+            "attachments": media_mod.download_message_attachments(session, content, directory, key),
+            "references": extract_references(content, session, directory, key, depth + 1),
+        }
+        for field in ("title", "svr_id"):
+            if isinstance(ref.get(field), str):
+                record[field] = ref[field]
+        partial = ref.get("partial_text")
+        if isinstance(partial, dict):
+            record["partial_text"] = {
+                k: partial[k] for k in ("start", "end", "startindex", "endindex", "quotemd5")
+                if k in partial and type(partial[k]) in (str, int)}
+        if depth == 2 and isinstance(quoted, dict) and quoted.get("ref_msg"):
+            record["references_truncated"] = True
+        references.append(record)
+    return references
+
+
+def inbox_media_paths(record, depth=0):
+    """Include quoted attachments and thumbnails when retaining pending-task inputs."""
+    paths = set()
+    for attachment in record.get("attachments") or []:
+        for part in (attachment, attachment.get("thumbnail") or {}):
+            if part.get("path"):
+                paths.add(os.path.abspath(part["path"]))
+    if depth < 3:
+        for ref in record.get("references") or []:
+            paths.update(inbox_media_paths(ref, depth + 1))
+    return paths
 
 
 def cmd_poll(args):
@@ -579,25 +632,9 @@ def _poll_locked(args):
             "attachments": [],
             "delayed_flushed": False,
         }
-        # download inbound media (image/file/voice/video) for the agent
-        try:
-            for mi in media_mod.extract_media_items(m):
-                fname = media_mod.sanitize_filename(
-                    mi.get("file_name") or "%s-%d.dat" % (mi["kind"], mi["index"]))
-                dest = os.path.join(
-                    ROOT, "media", time.strftime("%Y-%m-%d"),
-                    "%s_%d_%s" % (key, mi["index"], fname))
-                ok, info = media_mod.download_attachment(
-                    sess, mi["media"], mi.get("aeskey"), dest)
-                rec["attachments"].append({
-                    "kind": mi["kind"],
-                    "path": dest if ok else None,
-                    "mime": info if ok else None,
-                    "ok": ok,
-                    "error": None if ok else info,
-                })
-        except Exception as e:
-            log("media download error %s: %s" % (key, e))
+        directory = os.path.join(ROOT, "media", time.strftime("%Y-%m-%d"))
+        rec["attachments"] = media_mod.download_message_attachments(sess, m, directory, key)
+        rec["references"] = extract_references(m, sess, directory, key)
         atomic_write_json(ipath, rec)
         added += 1
         log_history(
@@ -751,7 +788,7 @@ def _send_locked(args):
                 if part["item_list"] is None:
                     spec = o["media"]
                     part["item_list"] = [media_mod.upload_media(
-                        http_post, sess, o["to_user_id"], spec["path"], spec["kind"])]
+                        http_post, sess, o["to_user_id"], spec["path"], spec["kind"], options=spec)]
                     _write_outbox(p, o)
                 body = {
                     "msg": {
@@ -827,7 +864,7 @@ def outbox_path(key):
 
 
 def queue_reply(reply_to, to_user_id, context_token, text, media=None):
-    """Queue a reply. media: {"kind": "image"|"file", "path": ...} or None."""
+    """Queue image/file/video/voice; voice specs require encode_type/sample_rate/playtime."""
     with Locked() as ok:
         if not ok:
             raise RuntimeError("bridge busy; retry queue_reply later")
@@ -841,6 +878,8 @@ def _queue_reply_locked(reply_to, to_user_id, context_token, text, media=None):
     p = outbox_path(reply_to)
     if os.path.exists(p):
         return p  # already queued/sent; never duplicate
+    if media is not None:
+        media_mod.validate_media_spec(media)
     _write_outbox(p, {
         "reply_to": reply_to,
         "account_id": account_id(sess),
@@ -963,13 +1002,24 @@ def cmd_send_media(args):
              "hint": "需要先收到对方一条消息再发送"}, ensure_ascii=False))
         return 1
     key = "manual_%s" % uuid.uuid4().hex[:12]
+    spec = {"kind": args.kind, "path": os.path.abspath(args.path)}
+    if args.kind == "voice":
+        for field in ("encode_type", "sample_rate", "playtime", "bits_per_sample"):
+            value = getattr(args, field, None)
+            if value is not None:
+                spec[field] = value
+    try:
+        media_mod.validate_media_spec(spec)
+    except ValueError as error:
+        print(json.dumps({"ok": False, "error": "INVALID_MEDIA", "hint": str(error)}, ensure_ascii=False))
+        return 1
     _write_outbox(os.path.join(OUTBOX, key + ".json"), {
         "reply_to": key,
         "account_id": account_id(sess),
         "to_user_id": rec["from_user_id"],
         "context_token": rec["context_token"],
         "text": args.text or "",
-        "media": {"kind": args.kind, "path": os.path.abspath(args.path)},
+        "media": spec,
         "status": "pending",
         "attempts": 0,
         "last_error": "",
@@ -1044,6 +1094,17 @@ def cmd_cleanup(args):
         for entry in queue:
             if entry.get("media"):
                 retained_media.add(os.path.abspath(entry["media"]["path"]))
+    for name in os.listdir(INBOX):
+        if not name.endswith(".json"):
+            continue
+        try:
+            with open(os.path.join(INBOX, name), encoding="utf-8") as stream:
+                entry = json.load(stream)
+            if entry.get("status") not in ("done", "failed"):
+                retained_media.update(inbox_media_paths(entry))
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            print(json.dumps({"ok": False, "error": "invalid_inbox_record"}))
+            return 1
     removed = 0
     for d in (INBOX, OUTBOX, os.path.join(ROOT, "media")):
         if not os.path.isdir(d):
@@ -1119,6 +1180,18 @@ def main():
     si.add_argument("path")
     si.add_argument("--text", default="")
 
+    video = sub.add_parser("send-video", help="queue an MP4 video")
+    video.add_argument("path")
+    video.add_argument("--text", default="")
+
+    voice = sub.add_parser("send-voice", help="experimental: queue already encoded audio")
+    voice.add_argument("path")
+    voice.add_argument("--text", default="")
+    voice.add_argument("--encode-type", type=int, choices=range(1, 9), required=True)
+    voice.add_argument("--sample-rate", type=int, required=True, help="Hz")
+    voice.add_argument("--playtime", type=int, required=True, help="duration in milliseconds")
+    voice.add_argument("--bits-per-sample", type=int, default=None, help="required for PCM")
+
     cc = sub.add_parser("cleanup")
     cc.add_argument("--days", type=int, default=30)
 
@@ -1154,6 +1227,9 @@ def main():
     if args.cmd == "send-image":
         args.kind = "image"
         return cmd_send_media(args)
+    if args.cmd in ("send-video", "send-voice"):
+        args.kind = "video" if args.cmd == "send-video" else "voice"
+        return cmd_send_media(args)
     if args.cmd == "cleanup":
         return cmd_cleanup(args)
     if args.cmd == "send-proactive":
@@ -1168,4 +1244,9 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except session_store.SessionEncryptionError as error:
+        print(json.dumps({"ok": False, "error": "SESSION_ENCRYPTION_ERROR",
+                          "hint": str(error)}, ensure_ascii=False))
+        sys.exit(1)

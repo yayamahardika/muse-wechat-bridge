@@ -24,7 +24,17 @@ MAX_MEDIA_BYTES = 25 * 1024 * 1024
 
 ITEM_KIND = {2: "image", 3: "voice", 4: "file", 5: "video"}
 UPLOAD_MEDIA_TYPE = {"image": 1, "video": 2, "file": 3, "voice": 4}
-OUTGOING_ITEM_TYPE = {"image": 2, "file": 4}
+OUTGOING_ITEM_TYPE = {"image": 2, "voice": 3, "file": 4, "video": 5}
+VOICE_EXTENSIONS = {
+    1: (".pcm",), 2: (".adpcm",), 3: (".dat",), 4: (".spx", ".speex"),
+    5: (".amr",), 6: (".silk", ".sil"), 7: (".mp3",), 8: (".ogg", ".spx"),
+}
+METADATA_FIELDS = {
+    "image": ("mid_size", "hd_size", "thumb_size", "thumb_width", "thumb_height"),
+    "voice": ("encode_type", "bits_per_sample", "sample_rate", "playtime"),
+    "file": ("file_name", "len", "md5"),
+    "video": ("video_size", "play_length", "video_md5", "thumb_size", "thumb_width", "thumb_height"),
+}
 
 MIME_BY_EXT = {
     ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
@@ -35,6 +45,10 @@ MIME_BY_EXT = {
     ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     ".xls": "application/vnd.ms-excel",
     ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ".mp4": "video/mp4", ".mp3": "audio/mpeg", ".amr": "audio/amr",
+    ".silk": "audio/silk", ".sil": "audio/silk", ".pcm": "audio/pcm",
+    ".adpcm": "audio/adpcm", ".spx": "audio/ogg", ".speex": "audio/ogg",
+    ".ogg": "audio/ogg", ".wav": "audio/wav",
 }
 
 
@@ -139,25 +153,91 @@ def sniff_mime(data):
         return "image/webp"
     if len(data) >= 8 and data[4:8] == b"ftyp":
         return "video/mp4"
+    if data.startswith((b"#!SILK_V3", b"\x02#!SILK_V3")):
+        return "audio/silk"
+    if data.startswith(b"#!AMR"):
+        return "audio/amr"
+    if data.startswith(b"ID3") or (len(data) >= 2 and data[0] == 0xff and data[1] & 0xe0 == 0xe0):
+        return "audio/mpeg"
+    if data.startswith(b"OggS"):
+        return "audio/ogg"
+    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WAVE":
+        return "audio/wav"
     return None
 
 
 def extract_media_items(msg):
-    """Return [{kind, index, media, aeskey, file_name}] for media items."""
+    """Extract media references and an allowlist of useful scalar metadata."""
     out = []
     for idx, item in enumerate(msg.get("item_list") or []):
+        if not isinstance(item, dict) or type(item.get("type")) is not int:
+            continue
         kind = ITEM_KIND.get(item.get("type"))
         if not kind:
             continue
         sub = item.get(kind + "_item") or {}
+        if not isinstance(sub, dict):
+            continue
         out.append({
             "kind": kind,
             "index": idx,
             "media": sub.get("media") or {},
             "aeskey": sub.get("aeskey"),
             "file_name": sub.get("file_name"),
+            "thumb_media": sub.get("thumb_media") if kind in ("image", "video") else None,
+            "metadata": {k: sub[k] for k in METADATA_FIELDS[kind]
+                         if k in sub and type(sub[k]) in (str, int, float)},
         })
     return out
+
+
+def download_message_attachments(session, msg, directory, prefix):
+    """Original and thumbnail failures are isolated from each other and other items."""
+    def download(ref, aeskey, path):
+        try:
+            ok, info = download_attachment(session, ref, aeskey, path)
+            return {"path": path if ok else None, "mime": info if ok else None,
+                    "ok": ok, "error": None if ok else info}
+        except Exception as error:
+            return {"path": None, "mime": None, "ok": False,
+                    "error": "download failed: %s" % type(error).__name__}
+
+    attachments = []
+    for item in extract_media_items(msg):
+        name = sanitize_filename(item.get("file_name") or "%s-%d.dat" % (item["kind"], item["index"]))
+        path = os.path.join(directory, "%s_%d_%s" % (prefix, item["index"], name))
+        attachment = download(item["media"], item.get("aeskey"), path)
+        attachment.update(kind=item["kind"], index=item["index"], metadata=item["metadata"])
+        thumb = item.get("thumb_media")
+        if isinstance(thumb, dict) and thumb:
+            # A thumbnail may carry a key different from the original image.
+            aeskey = None if thumb.get("aes_key") else item.get("aeskey")
+            attachment["thumbnail"] = download(thumb, aeskey, path + ".thumb.dat")
+        attachments.append(attachment)
+    return attachments
+
+
+def validate_media_spec(spec):
+    if not isinstance(spec, dict) or spec.get("kind") not in OUTGOING_ITEM_TYPE:
+        raise ValueError("kind must be image, file, video or voice")
+    if not isinstance(spec.get("path"), str) or not spec["path"]:
+        raise ValueError("media path is required")
+    if spec["kind"] == "voice":
+        encoding = spec.get("encode_type")
+        if type(encoding) is not int or encoding not in VOICE_EXTENSIONS:
+            raise ValueError("voice encode_type must be an explicit integer from 1 to 8")
+        for field in ("sample_rate", "playtime"):
+            if type(spec.get(field)) is not int or spec[field] <= 0:
+                raise ValueError("voice %s must be a positive integer" % field)
+        bits = spec.get("bits_per_sample")
+        if bits is not None and (type(bits) is not int or not 1 <= bits <= 64):
+            raise ValueError("voice bits_per_sample must be an integer from 1 to 64")
+        if encoding == 1 and bits is None:
+            raise ValueError("PCM voice requires bits_per_sample")
+        if os.path.splitext(spec["path"])[1].lower() not in VOICE_EXTENSIONS[encoding]:
+            raise ValueError("voice file extension does not match encode_type; transcode first")
+    if spec["kind"] == "video" and os.path.splitext(spec["path"])[1].lower() != ".mp4":
+        raise ValueError("video currently requires an MP4 file")
 
 
 def download_attachment(session, media_ref, aeskey_value, dest_path,
@@ -193,14 +273,14 @@ def download_attachment(session, media_ref, aeskey_value, dest_path,
     return True, sniff_mime(data)
 
 
-def upload_media(api_post, session, to_user_id, file_path, kind):
+def upload_media(api_post, session, to_user_id, file_path, kind, options=None):
     """
     Encrypt + upload a local file, return the sendMessage item dict.
     api_post: callable(base, path, body, bot_token, timeout) -> (resp, err)
-    kind: "image" or "file"
+    kind: image/file/video/voice. Voice options must describe the supplied audio.
     """
-    if kind not in ("image", "file"):
-        raise ValueError("kind must be image or file")
+    spec = dict(options or {}, kind=kind, path=file_path)
+    validate_media_spec(spec)
     if not os.path.isfile(file_path):
         raise ValueError("not a file: %s" % file_path)
     size = os.path.getsize(file_path)
@@ -208,12 +288,16 @@ def upload_media(api_post, session, to_user_id, file_path, kind):
         raise ValueError("file too large (>25MB)")
     ext = os.path.splitext(file_path)[1].lower()
     mime = MIME_BY_EXT.get(ext)
-    if not mime or (kind == "image" and not mime.startswith("image/")):
+    if (not mime and kind != "voice") or (kind == "image" and not mime.startswith("image/")):
         raise ValueError("unsupported type for %s: %s" % (kind, ext or "?"))
     with open(file_path, "rb") as f:
         raw = f.read(MAX_MEDIA_BYTES + 1)
     if len(raw) > MAX_MEDIA_BYTES:
         raise ValueError("file too large (>25MB)")
+    if kind == "video" and sniff_mime(raw) != "video/mp4":
+        raise ValueError("video file does not have an MP4 header")
+    if kind == "voice" and not raw:
+        raise ValueError("voice file is empty")
     key = os.urandom(16)
     key_hex = key.hex()
     enc = aes_ecb_encrypt(raw, key)
@@ -263,6 +347,14 @@ def upload_media(api_post, session, to_user_id, file_path, kind):
     if kind == "image":
         return {"type": OUTGOING_ITEM_TYPE["image"],
                 "image_item": {"media": media, "mid_size": len(enc)}}
+    if kind == "video":
+        return {"type": OUTGOING_ITEM_TYPE["video"],
+                "video_item": {"media": media, "video_size": len(enc)}}
+    if kind == "voice":
+        voice = {k: spec[k] for k in ("encode_type", "sample_rate", "playtime", "bits_per_sample")
+                 if spec.get(k) is not None}
+        voice["media"] = media
+        return {"type": OUTGOING_ITEM_TYPE["voice"], "voice_item": voice}
     return {"type": OUTGOING_ITEM_TYPE["file"],
             "file_item": {"media": media,
                           "file_name": sanitize_filename(os.path.basename(file_path)),

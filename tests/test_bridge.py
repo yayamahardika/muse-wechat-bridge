@@ -1,4 +1,5 @@
 """Offline regression checks. Network access is replaced with deterministic replies."""
+import base64
 import copy
 import io
 import json
@@ -15,6 +16,7 @@ from unittest.mock import patch
 import bridge
 import media
 import runtime_io
+import session_store
 
 
 class Response(io.BytesIO):
@@ -26,6 +28,10 @@ class Response(io.BytesIO):
 
 class BridgeTests(unittest.TestCase):
     def setUp(self):
+        key = base64.b64encode(os.urandom(32)).decode("ascii")
+        key_env = patch.dict(os.environ, {session_store.KEY_ENV: key})
+        key_env.start()
+        self.addCleanup(key_env.stop)
         self.temp = tempfile.TemporaryDirectory(prefix="wechat-regression-")
         self.addCleanup(self.temp.cleanup)
         root = self.temp.name
@@ -65,6 +71,62 @@ class BridgeTests(unittest.TestCase):
 
     def queue(self, key="reply", media_spec=None):
         return bridge.queue_reply(key, "owner", "test-context", "caption", media_spec)
+
+    def test_session_file_is_encrypted_and_readable(self):
+        content = Path(bridge.session_path()).read_text(encoding="utf-8")
+        self.assertNotIn(self.session["bot_token"], content)
+        self.assertEqual(json.loads(content)["format"], session_store.FORMAT)
+        self.assertEqual(bridge.load_session(), self.session)
+
+    def test_legacy_plaintext_session_migrates_on_read(self):
+        runtime_io.atomic_write_json(bridge.session_path(), self.session)
+        self.assertEqual(bridge.load_session(), self.session)
+        content = Path(bridge.session_path()).read_text(encoding="utf-8")
+        self.assertNotIn(self.session["bot_token"], content)
+        self.assertEqual(json.loads(content)["version"], 1)
+        self.assertEqual(bridge.load_session(), self.session)
+
+    def test_failed_session_migration_keeps_original_file(self):
+        runtime_io.atomic_write_json(bridge.session_path(), self.session)
+        original = Path(bridge.session_path()).read_bytes()
+        with patch.object(session_store, "protect", side_effect=session_store.SessionEncryptionError("unavailable")):
+            with self.assertRaises(session_store.SessionEncryptionError):
+                bridge.load_session()
+        self.assertEqual(Path(bridge.session_path()).read_bytes(), original)
+
+    def test_session_migration_replacement_failure_keeps_original_file(self):
+        runtime_io.atomic_write_json(bridge.session_path(), self.session)
+        original = Path(bridge.session_path()).read_bytes()
+        with patch.object(runtime_io.os, "replace", side_effect=OSError("replace failed")):
+            with self.assertRaises(OSError):
+                bridge.load_session()
+        self.assertEqual(Path(bridge.session_path()).read_bytes(), original)
+        self.assertEqual(list(Path(bridge.STATE).glob(".*.tmp")), [])
+
+    def test_encryption_failure_never_replaces_existing_session(self):
+        original = Path(bridge.session_path()).read_bytes()
+        with patch.object(session_store, "protect", side_effect=session_store.SessionEncryptionError("unavailable")):
+            with self.assertRaises(session_store.SessionEncryptionError):
+                bridge.save_session(dict(self.session, bot_token="replacement-token"))
+        self.assertEqual(Path(bridge.session_path()).read_bytes(), original)
+
+    def test_corrupt_encrypted_session_prevents_network_access(self):
+        runtime_io.atomic_write_json(bridge.session_path(), {
+            "format": session_store.FORMAT, "version": 999, "scheme": "windows-dpapi"})
+        with patch.object(bridge, "http_post") as post:
+            with self.assertRaises(session_store.SessionEncryptionError):
+                bridge.cmd_poll(self.args)
+        post.assert_not_called()
+
+    def test_session_lock_prevents_migration_and_overwrite(self):
+        original = Path(bridge.session_path()).read_bytes()
+        with bridge.Locked("session.lock") as acquired:
+            self.assertTrue(acquired)
+            with self.assertRaises(session_store.SessionEncryptionError):
+                bridge.load_session()
+            with self.assertRaises(session_store.SessionEncryptionError):
+                bridge.save_session(self.session)
+        self.assertEqual(Path(bridge.session_path()).read_bytes(), original)
 
     def test_voice_transcript_reaches_inbox_and_history_when_download_fails(self):
         message = self.message()
@@ -108,6 +170,205 @@ class BridgeTests(unittest.TestCase):
             with self.subTest(voice=voice):
                 message = {"item_list": [{"type": 3, "voice_item": voice}]}
                 self.assertEqual(bridge.extract_text_and_media(message), ("", True))
+
+    def test_quoted_text_is_separate_from_current_instruction(self):
+        message = self.message()
+        message["item_list"][0]["ref_msg"] = {
+            "title": "旧消息", "svr_id": "9007199254740993",
+            "partial_text": {"start": "旧", "end": "消息", "startindex": 0, "endindex": 3},
+            "message_item": {"type": 1, "text_item": {"text": "引用内容"}},
+        }
+        self.poll([message])
+        record = json.loads(Path(bridge.INBOX, "1_1.json").read_text(encoding="utf-8"))
+        self.assertEqual(record["text"], "task")
+        ref = record["references"][0]
+        self.assertEqual(ref["text"], "引用内容")
+        self.assertEqual(ref["svr_id"], "9007199254740993")
+        self.assertEqual(ref["partial_text"]["endindex"], 3)
+        self.assertTrue(ref["content_available"])
+
+    def test_reference_with_only_id_does_not_invent_content(self):
+        message = self.message()
+        message["item_list"][0]["ref_msg"] = {"svr_id": "missing", "title": "摘要"}
+        self.poll([message])
+        record = json.loads(Path(bridge.INBOX, "1_1.json").read_text(encoding="utf-8"))
+        ref = record["references"][0]
+        self.assertFalse(ref["content_available"])
+        self.assertEqual(ref["text"], "")
+        self.assertEqual(ref["title"], "摘要")
+
+    def test_quoted_voice_transcript_and_media_are_available(self):
+        message = self.message()
+        message["item_list"][0]["ref_msg"] = {"message_item": {
+            "type": 3, "voice_item": {"text": "引用语音", "playtime": 1500}}}
+        with patch.object(media, "download_attachment", return_value=(False, "missing audio")):
+            self.poll([message])
+        record = json.loads(Path(bridge.INBOX, "1_1.json").read_text(encoding="utf-8"))
+        ref = record["references"][0]
+        self.assertEqual(ref["text"], "引用语音")
+        self.assertTrue(ref["has_media"])
+        self.assertEqual(ref["attachments"][0]["metadata"]["playtime"], 1500)
+
+    def test_reference_nesting_is_bounded(self):
+        item = {"type": 1, "text_item": {"text": "context"}}
+        item["ref_msg"] = {"message_item": item}
+        refs = bridge.extract_references({"item_list": [item]}, self.session, self.temp.name, "safe")
+        self.assertEqual(refs[0]["references"][0]["references"][0]["references"], [])
+        self.assertTrue(refs[0]["references"][0]["references"][0]["references_truncated"])
+
+    def test_original_failure_does_not_skip_thumbnail_or_next_attachment(self):
+        message = self.message()
+        message["item_list"] = [
+            {"type": 5, "video_item": {"video_size": 120, "play_length": 3,
+                "media": {"encrypt_query_param": "video"},
+                "thumb_media": {"encrypt_query_param": "thumb"}}},
+            {"type": 4, "file_item": {"file_name": "report.txt", "len": "12"}},
+        ]
+        with patch.object(media, "download_attachment", side_effect=[
+                OSError("original failed"), (True, "image/png"), (True, "text/plain")]):
+            self.poll([message])
+        record = json.loads(Path(bridge.INBOX, "1_1.json").read_text(encoding="utf-8"))
+        video, document = record["attachments"]
+        self.assertFalse(video["ok"])
+        self.assertTrue(video["thumbnail"]["ok"])
+        self.assertTrue(document["ok"])
+        self.assertEqual(document["metadata"]["file_name"], "report.txt")
+        self.assertEqual(video["metadata"]["play_length"], 3)
+
+    def test_thumbnail_uses_its_own_decryption_key(self):
+        original_key, thumb_key = b"0123456789abcdef", b"fedcba9876543210"
+        png = b"\x89PNG\r\n\x1a\npreview"
+        message = {"item_list": [{"type": 2, "image_item": {
+            "aeskey": original_key.hex(), "media": {"full_url": media.CDN_BASE + "/image"},
+            "thumb_media": {"full_url": media.CDN_BASE + "/thumb",
+                            "aes_key": base64.b64encode(thumb_key).decode("ascii")}}}]}
+        with patch.object(media, "open_weixin_url", side_effect=[
+                Response(media.aes_ecb_encrypt(png, original_key)),
+                Response(media.aes_ecb_encrypt(png, thumb_key))]):
+            attachments = media.download_message_attachments(self.session, message, self.temp.name, "photo")
+        attachment = attachments[0]
+        self.assertTrue(attachment["ok"])
+        self.assertTrue(attachment["thumbnail"]["ok"])
+        self.assertEqual(Path(attachment["thumbnail"]["path"]).read_bytes(), png)
+        self.assertNotEqual(attachment["path"], attachment["thumbnail"]["path"])
+
+    def test_pending_task_retains_quoted_media_and_thumbnail_during_cleanup(self):
+        message = self.message()
+        message["item_list"][0]["ref_msg"] = {"message_item": {
+            "type": 2, "image_item": {"media": {"encrypt_query_param": "full"},
+                                      "thumb_media": {"encrypt_query_param": "thumb"}}}}
+
+        def download(session, ref, aeskey, path):
+            runtime_io.private_directory(os.path.dirname(path))
+            Path(path).write_bytes(b"test")
+            os.utime(path, (0, 0))
+            return True, "image/png"
+
+        with patch.object(media, "download_attachment", side_effect=download):
+            self.poll([message])
+        inbox = Path(bridge.INBOX, "1_1.json")
+        record = json.loads(inbox.read_text(encoding="utf-8"))
+        paths = bridge.inbox_media_paths(record)
+        self.assertEqual(len(paths), 2)
+        bridge.cmd_cleanup(SimpleNamespace(days=1))
+        self.assertTrue(all(Path(path).exists() for path in paths))
+        record["status"] = "done"
+        runtime_io.atomic_write_json(str(inbox), record)
+        bridge.cmd_cleanup(SimpleNamespace(days=1))
+        self.assertTrue(all(not Path(path).exists() for path in paths))
+
+    def test_video_and_voice_upload_build_expected_protocol_items(self):
+        for kind, ext, raw, options, upload_type, item_type in [
+                ("video", ".mp4", b"\x00\x00\x00\x18ftypmp42test", {}, 2, 5),
+                ("voice", ".mp3", b"ID3test-audio", {"encode_type": 7, "sample_rate": 24000, "playtime": 1500}, 4, 3)]:
+            with self.subTest(kind=kind):
+                path = str(Path(self.temp.name, "sample" + ext))
+                Path(path).write_bytes(raw)
+                calls = []
+
+                def api(base, route, body, token, timeout):
+                    calls.append(body)
+                    return {"upload_param": "upload"}, None
+
+                with patch.object(media, "open_weixin_url", return_value=Response(
+                        headers={"x-encrypted-param": "download"})) as remote:
+                    item = media.upload_media(api, self.session, "owner", path, kind, options=options)
+                self.assertEqual(calls[0]["media_type"], upload_type)
+                self.assertEqual(item["type"], item_type)
+                encrypted = remote.call_args.args[0].data
+                key = bytes.fromhex(calls[0]["aeskey"])
+                self.assertEqual(media.aes_ecb_decrypt(encrypted, key), raw)
+                if kind == "video":
+                    self.assertEqual(item["video_item"]["video_size"], len(encrypted))
+                else:
+                    self.assertEqual(item["voice_item"]["encode_type"], 7)
+                    self.assertEqual(item["voice_item"]["playtime"], 1500)
+                    self.assertEqual(item["voice_item"]["sample_rate"], 24000)
+
+    def test_invalid_voice_spec_is_rejected_before_queue_or_network(self):
+        base = {"kind": "voice", "path": "sample.mp3", "encode_type": 7,
+                "sample_rate": 24000, "playtime": 1000}
+        for changes in ({"encode_type": 99}, {"encode_type": True}, {"playtime": 0},
+                        {"sample_rate": None}, {"path": "sample.wav"}, {"bits_per_sample": -1},
+                        {"encode_type": 1, "path": "sample.pcm"}):
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                self.queue(media_spec=dict(base, **changes))
+        self.assertEqual(os.listdir(bridge.OUTBOX), [])
+
+    def test_invalid_video_or_empty_voice_never_requests_upload(self):
+        for kind, name, raw, options in [
+                ("video", "fake.mp4", b"not a video", {}),
+                ("voice", "empty.mp3", b"", {"encode_type": 7, "sample_rate": 24000, "playtime": 1000})]:
+            path = str(Path(self.temp.name, name))
+            Path(path).write_bytes(raw)
+            with self.subTest(kind=kind), patch.object(bridge, "http_post") as api:
+                with self.assertRaises(ValueError):
+                    media.upload_media(api, self.session, "owner", path, kind, options=options)
+                api.assert_not_called()
+
+    def test_video_and_voice_send_retries_reuse_upload_and_client_id(self):
+        for kind, ext, item_type, options in [
+                ("video", ".mp4", 5, {}),
+                ("voice", ".mp3", 3, {"encode_type": 7, "sample_rate": 24000, "playtime": 1000})]:
+            spec = dict(options, kind=kind, path="unused" + ext)
+            bridge.queue_reply(kind, "owner", "test-context", "", spec)
+            with self.subTest(kind=kind), \
+                    patch.object(media, "upload_media", return_value={"type": item_type}) as upload, \
+                    patch.object(bridge, "http_post", side_effect=[(None, "timeout"), ({"ret": 0}, None)]) as post:
+                bridge.cmd_send(self.args)
+                bridge.cmd_send(self.args)
+                upload.assert_called_once()
+                self.assertEqual(upload.call_args.kwargs["options"], spec)
+                first, second = [call.args[2]["msg"] for call in post.call_args_list]
+                self.assertEqual(first["client_id"], second["client_id"])
+                self.assertEqual(first["item_list"][0]["type"], item_type)
+                self.assertEqual(self.read_reply(kind)["status"], "sent")
+
+    def test_send_voice_command_preserves_options_in_queue(self):
+        self.poll([self.message()])
+        path = Path(self.temp.name, "reply.mp3")
+        path.write_bytes(b"ID3sample")
+        args = SimpleNamespace(kind="voice", path=str(path), text="语音回复", encode_type=7,
+                               sample_rate=24000, playtime=1000, bits_per_sample=None)
+        self.assertEqual(bridge.cmd_send_media(args), 0)
+        record = json.loads(next(Path(bridge.OUTBOX).glob("*.json")).read_text(encoding="utf-8"))
+        self.assertEqual(record["media"]["encode_type"], 7)
+        self.assertEqual(record["text"], "语音回复")
+        self.assertEqual(record["media"]["path"], str(path))
+
+    def test_media_cli_dispatches_video_and_voice_with_explicit_parameters(self):
+        for command, options, kind in [
+                ("send-video", [], "video"),
+                ("send-voice", ["--encode-type", "7", "--sample-rate", "24000",
+                                "--playtime", "1500"], "voice")]:
+            with self.subTest(command=command), patch.object(sys, "argv", [
+                    "bridge.py", command, "sample.mp3" if kind == "voice" else "sample.mp4"] + options), \
+                    patch.object(bridge, "cmd_send_media", return_value=0) as send:
+                self.assertEqual(bridge.main(), 0)
+                args = send.call_args.args[0]
+                self.assertEqual(args.kind, kind)
+                if kind == "voice":
+                    self.assertEqual((args.encode_type, args.sample_rate, args.playtime), (7, 24000, 1500))
 
     def test_cursor_survives_failed_inbox_write(self):
         bridge.save_cursor("old")
