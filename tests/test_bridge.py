@@ -73,6 +73,11 @@ class BridgeTests(unittest.TestCase):
     def queue(self, key="reply", media_spec=None):
         return bridge.queue_reply(key, "owner", "test-context", "caption", media_spec)
 
+    def send_when_due(self, key="reply"):
+        due = self.read_reply(key).get("next_attempt_at", 0)
+        with patch.object(bridge.time, "time", return_value=max(time.time(), due) + 1):
+            bridge.cmd_send(self.args)
+
     def test_session_file_is_encrypted_and_readable(self):
         content = Path(bridge.session_path()).read_text(encoding="utf-8")
         self.assertNotIn(self.session["bot_token"], content)
@@ -491,7 +496,7 @@ class BridgeTests(unittest.TestCase):
             self.assertEqual(self.read_reply()["media"]["path"], str(source))
             self.assertEqual(self.read_reply()["media"]["kind"], "file")
             source.unlink()
-            bridge.cmd_send(self.args)
+            self.send_when_due()
             convert.assert_not_called()
             upload.assert_called_once()
             self.assertEqual(upload.call_args.args[3:5], (str(source), "file"))
@@ -510,9 +515,9 @@ class BridgeTests(unittest.TestCase):
             bridge.cmd_send(self.args)
             upload.assert_not_called()
             post.assert_not_called()
-        self.assertEqual(self.read_reply()["status"], "pending")
+        self.assertEqual(self.read_reply()["status"], "failed")
         self.assertEqual(self.read_reply()["media"]["path"], str(source))
-        self.assertIn("decode failed", self.read_reply()["last_error"])
+        self.assertEqual(self.read_reply()["last_error"], "VoiceConversionError")
 
     def test_transcoded_path_is_durable_even_when_upload_fails(self):
         source, encoded = Path(self.temp.name, "reply.silk"), Path(self.temp.name, "reply.wav")
@@ -527,7 +532,7 @@ class BridgeTests(unittest.TestCase):
             bridge.cmd_send(self.args)
             self.assertEqual(self.read_reply()["media"]["path"], str(encoded))
             source.unlink()
-            bridge.cmd_send(self.args)
+            self.send_when_due()
             convert.assert_called_once()
             self.assertEqual(upload.call_count, 2)
         self.assertEqual(self.read_reply()["status"], "sent")
@@ -555,7 +560,7 @@ class BridgeTests(unittest.TestCase):
                     patch.object(media, "upload_media", return_value=uploaded) as upload, \
                     patch.object(bridge, "http_post", side_effect=[(None, "timeout"), ({"ret": 0}, None)]) as post:
                 bridge.cmd_send(self.args)
-                bridge.cmd_send(self.args)
+                self.send_when_due(kind)
                 upload.assert_called_once()
                 self.assertEqual(upload.call_args.kwargs["options"]["path"], path)
                 self.assertEqual(upload.call_args.args[4], "file" if kind == "voice" else "video")
@@ -680,7 +685,7 @@ class BridgeTests(unittest.TestCase):
             progress = self.read_reply()
             self.assertTrue(progress["delivery"][0]["sent"])
             self.assertFalse(progress["delivery"][1]["sent"])
-            bridge.cmd_send(self.args)
+            self.send_when_due()
         self.assertEqual([m["item_list"][0]["type"] for m in calls], [2, 1, 1])
         self.assertEqual(calls[1]["client_id"], calls[2]["client_id"])
         upload.assert_called_once()
@@ -692,7 +697,7 @@ class BridgeTests(unittest.TestCase):
             bridge.cmd_send(self.args)
         first = self.read_reply()["delivery"][0]["client_id"]
         with patch.object(bridge, "http_post", return_value=({"message_id": 10}, None)) as post:
-            bridge.cmd_send(self.args)
+            self.send_when_due()
         self.assertEqual(post.call_args.args[2]["msg"]["client_id"], first)
         self.assertEqual(self.read_reply()["status"], "sent")
 

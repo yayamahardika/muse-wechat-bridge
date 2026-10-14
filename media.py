@@ -10,13 +10,16 @@ Typing:   getConfig -> typing_ticket -> sendTyping(1/2).
 import base64
 import hashlib
 import os
+import session_store
 import re
 import time
 import urllib.parse
 import urllib.request
+import urllib.error
 import uuid
 
 from Crypto.Cipher import AES
+from delivery_policy import DeliveryError, transport_error
 from runtime_io import private_directory, private_file
 
 CDN_BASE = "https://novac2c.cdn.weixin.qq.com/c2c"
@@ -193,11 +196,16 @@ def download_message_attachments(session, msg, directory, prefix):
     def download(ref, aeskey, path):
         try:
             ok, info = download_attachment(session, ref, aeskey, path)
-            return {"path": path if ok else None, "mime": info if ok else None,
-                    "ok": ok, "error": None if ok else info}
         except Exception as error:
-            return {"path": None, "mime": None, "ok": False,
-                    "error": "download failed: %s" % type(error).__name__}
+            ok, info = False, "download failed: %s" % type(error).__name__
+        result = {"path": path if ok else None, "mime": info if ok else None,
+                  "ok": ok, "error": None if ok else info}
+        if not ok:
+            # URLs/keys never appear in plaintext inbox fields or diagnostics.
+            result["retry"] = {"source": session_store.protect(
+                {"ref": ref, "aeskey": aeskey, "path": path}),
+                "attempts": 1, "next_attempt_at": time.time() + 30}
+        return result
 
     attachments = []
     for item in extract_media_items(msg):
@@ -212,6 +220,36 @@ def download_message_attachments(session, msg, directory, prefix):
             attachment["thumbnail"] = download(thumb, aeskey, path + ".thumb.dat")
         attachments.append(attachment)
     return attachments
+
+
+def retry_attachment(session, part):
+    """Retry one failed original/thumbnail; caller durably commits the result."""
+    retry = part.get("retry") or {}
+    if (part.get("ok") or not retry or retry.get("stopped") or retry.get("attempts", 0) >= 5
+            or retry.get("next_attempt_at", 0) > time.time()):
+        return False
+    try:
+        source = session_store.unprotect(retry["source"])
+        if (not isinstance(source.get("ref"), dict)
+                or not isinstance(source.get("path"), str) or not source["path"]):
+            raise ValueError("invalid source")
+    except (session_store.SessionEncryptionError, KeyError, TypeError, ValueError):
+        # Preserve ciphertext for diagnosis; never expose secrets or stop other work.
+        retry["stopped"] = True
+        part["error"] = "retry_source_unavailable"
+        return True
+    try:
+        ok, info = download_attachment(session, source["ref"], source.get("aeskey"), source["path"])
+    except Exception as error:
+        ok, info = False, "download failed: %s" % type(error).__name__
+    if ok:
+        part.update(path=source["path"], mime=info, ok=True, error=None)
+        part.pop("retry", None)
+    else:
+        retry["attempts"] += 1
+        retry["next_attempt_at"] = time.time() + min(3600, 30 * 2 ** (retry["attempts"] - 1))
+        part["error"] = info
+    return True
 
 
 def _validate_silk_header(header, size):
@@ -331,7 +369,9 @@ def upload_media(api_post, session, to_user_id, file_path, kind, options=None):
     }
     resp, err = api_post(base, "/ilink/bot/getuploadurl", up_req, token, 30)
     if err:
-        raise RuntimeError("getUploadUrl failed: %s" % err)
+        raise transport_error(err)
+    if resp.get("ret") not in (None, 0):
+        raise DeliveryError("business_unknown", "upload_ret_%s" % resp["ret"])
     upload_url = resp.get("upload_full_url")
     if not upload_url:
         up = resp.get("upload_param")
@@ -345,6 +385,8 @@ def upload_media(api_post, session, to_user_id, file_path, kind, options=None):
         with open_weixin_url(req, timeout=60) as r:
             status = r.status
             dl_param = r.headers.get("x-encrypted-param")
+    except urllib.error.HTTPError as e:
+        raise transport_error("http_%d" % e.code) from None
     except Exception as e:
         raise RuntimeError("cdn upload failed: %s" % type(e).__name__)
     if status != 200 or not dl_param:

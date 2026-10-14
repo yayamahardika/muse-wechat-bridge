@@ -28,6 +28,7 @@ Do NOT invent interface rules: auth headers, bodies, redirects and error
 handling follow the documents above.
 """
 import argparse
+import contextlib
 import base64
 import datetime
 import functools
@@ -45,6 +46,7 @@ import uuid
 import media as media_mod
 import session_store
 import voice_codec
+from delivery_policy import DeliveryError, classify, retry_delay, transport_error
 from runtime_io import atomic_write_json, atomic_write_text, private_directory, private_file
 
 if os.name == "nt":
@@ -171,6 +173,8 @@ def account_id(sess):
 
 
 def belongs_to_session(rec, sess, inbound=False):
+    if not isinstance(rec, dict):
+        return False
     user_field = "from_user_id" if inbound else "to_user_id"
     if not valid_session(sess) or rec.get(user_field) != sess["ilink_user_id"]:
         return False
@@ -231,8 +235,36 @@ def set_pause(seconds):
 
 
 def touch_tick():
-    with open(os.path.join(STATE, "last_tick.txt"), "w") as f:
-        f.write(time.strftime("%Y-%m-%dT%H:%M:%S%z"))
+    atomic_write_text(os.path.join(STATE, "last_tick.txt"),
+                      datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=8))).isoformat())
+
+
+def read_health(sess, operation):
+    if not valid_session(sess):
+        return {}
+    path = os.path.join(STATE, "health-%s-%s.json" % (account_id(sess), operation))
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, encoding="utf-8") as stream:
+            value = json.load(stream)
+        return value if isinstance(value, dict) else {"diagnostic_error": "invalid_health_record"}
+    except (OSError, ValueError):
+        return {"diagnostic_error": "invalid_health_record"}
+
+
+def record_health(sess, operation, attempt=False, success=False, error=None):
+    """One writer per operation lock; timestamps distinguish attempts from durable success."""
+    value = read_health(sess, operation)
+    now = time.time()
+    if attempt:
+        value["last_attempt_at"] = now
+    if success:
+        value.update(last_success_at=now, last_error=None, consecutive_failures=0)
+    if error:
+        value.update(last_error=error, last_failure_at=now,
+                     consecutive_failures=value.get("consecutive_failures", 0) + 1)
+    atomic_write_json(os.path.join(STATE, "health-%s-%s.json" % (account_id(sess), operation)), value)
 
 
 class Locked:
@@ -284,6 +316,19 @@ def serialized(func):
     return run
 
 
+def transport_exclusive(func):
+    """Account switching/cleanup must not race any staged network operation."""
+    @functools.wraps(func)
+    def run(*args, **kwargs):
+        with contextlib.ExitStack() as stack:
+            for name in ("poll.lock", "send.lock", "media-retry.lock"):
+                if not stack.enter_context(Locked(name)):
+                    print(json.dumps({"ok": True, "skipped": "locked"}))
+                    return 0
+            return func(*args, **kwargs)
+    return run
+
+
 def log(msg):
     ensure_dirs()
     line = "%s %s\n" % (time.strftime("%Y-%m-%dT%H:%M:%S%z"), msg)
@@ -322,6 +367,7 @@ def log_history(direction, text, user_id=None, attachments=None):
 
 # ---------- login ----------
 
+@transport_exclusive
 @serialized
 def cmd_login(args):
     ensure_dirs()
@@ -384,6 +430,7 @@ def render_qr(qrcode_value, img_content, png_path):
         return False
 
 
+@transport_exclusive
 @serialized
 def cmd_wait_login(args):
     ensure_dirs()
@@ -427,6 +474,13 @@ def cmd_wait_login(args):
                 save_cursor("")
                 set_pause(0)
             save_session(sess)
+            for operation in ("poll", "send"):
+                health = read_health(sess, operation)
+                if health.get("last_error") in ("http_401", "http_403"):
+                    health["last_error"] = None
+                    health["consecutive_failures"] = 0
+                    atomic_write_json(os.path.join(STATE, "health-%s-%s.json" %
+                                                   (account_id(sess), operation)), health)
             try:
                 os.remove(qp)
             except OSError:
@@ -505,6 +559,7 @@ def cached_attachments(attachments):
                 continue
             if part is not item:
                 item["thumbnail"] = part = dict(part)
+            part.pop("retry", None)  # retry only the original inbox record
             if part.get("path") and not os.path.isfile(part["path"]):
                 part.update(path=None, ok=False, error="cached attachment no longer available")
         result.append(item)
@@ -617,9 +672,144 @@ def inbox_media_paths(record, depth=0):
     return paths
 
 
+def attachment_parts(record, depth=0):
+    for attachment in record.get("attachments") or []:
+        yield attachment
+        if attachment.get("thumbnail"):
+            yield attachment["thumbnail"]
+    if depth < 3:
+        for reference in record.get("references") or []:
+            yield from attachment_parts(reference, depth + 1)
+
+
+def media_retry_pending(record):
+    return any(not part.get("ok") and part.get("retry")
+               and not part["retry"].get("stopped")
+               and part["retry"].get("attempts", 0) < 5 for part in attachment_parts(record))
+
+
+def _load_inbox_record(path):
+    """Validate structures traversed by recovery scans before doing any work."""
+    with open(path, encoding="utf-8") as stream:
+        record = json.load(stream)
+
+    def validate(value, depth=0):
+        if not isinstance(value, dict) or depth > 3:
+            raise ValueError("invalid inbox record")
+        for field in ("attachments", "references", "item_messages"):
+            items = value.get(field) or []
+            if not isinstance(items, list) or any(not isinstance(item, dict) for item in items):
+                raise ValueError("invalid inbox collection")
+        for part in attachment_parts(dict(value, references=[])):
+            if not isinstance(part, dict):
+                raise ValueError("invalid attachment")
+            retry = part.get("retry")
+            if retry is not None and (not isinstance(retry, dict)
+                    or type(retry.get("attempts", 0)) is not int
+                    or type(retry.get("next_attempt_at", 0)) not in (int, float)):
+                raise ValueError("invalid attachment retry")
+        for reference in value.get("references") or []:
+            validate(reference, depth + 1)
+        for item in value.get("item_messages") or []:
+            validate(item, depth + 1)
+
+    validate(record)
+    return record
+
+
+def _refresh_reference_snapshots(sess):
+    """Also run with no due downloads, so a crash after recovery is repairable."""
+    def refresh(references):
+        changed = False
+        for reference in references or []:
+            if reference.get("resolution") == "local_history" and reference.get("reference_id"):
+                cached = find_cached_reference(reference["reference_id"], sess)
+                if cached is not None and any(reference.get(k) != v for k, v in cached.items()):
+                    reference.update(cached)
+                    changed = True
+            changed = refresh(reference.get("references")) or changed
+        return changed
+
+    for name in sorted(os.listdir(INBOX)):
+        if not name.endswith(".json"):
+            continue
+        with Locked() as ok:
+            if not ok:
+                return
+            path = os.path.join(INBOX, name)
+            try:
+                record = _load_inbox_record(path)
+            except (OSError, ValueError):
+                continue
+            if belongs_to_session(record, sess, inbound=True) and refresh(record.get("references")):
+                atomic_write_json(path, record)
+
+
+def cmd_retry_media(args):
+    with Locked("media-retry.lock") as ok:
+        if not ok:
+            print(json.dumps({"ok": True, "skipped": "locked"}))
+            return 0
+        return _retry_media_locked(args)
+
+
+def _retry_media_locked(args):
+    limit = getattr(args, "limit", 20)
+    if limit < 1:
+        raise ValueError("limit must be positive")
+    with Locked() as ok:
+        if not ok:
+            print(json.dumps({"ok": True, "skipped": "locked"}))
+            return 0
+        sess = load_session()
+    if not valid_session(sess):
+        print(json.dumps({"ok": False, "error": "NO_SESSION"}))
+        return 1
+    attempted = recovered = 0
+    for name in sorted(os.listdir(INBOX)):
+        if not name.endswith(".json") or attempted >= limit:
+            continue
+        path = os.path.join(INBOX, name)
+        try:
+            record = _load_inbox_record(path)
+        except (OSError, ValueError):
+            log("invalid inbox record retained: %s" % name)
+            continue
+        if not belongs_to_session(record, sess, inbound=True):
+            continue
+        changed = False
+        for part in attachment_parts(record):
+            if attempted >= limit:
+                break
+            if media_mod.retry_attachment(sess, part):
+                record_health(sess, "media", attempt=True)
+                attempted += 1
+                recovered += int(bool(part.get("ok")))
+                changed = True
+        if changed:
+            with Locked() as ok:
+                if not ok:
+                    # No progress commit: next retry is safe and downloads are idempotent.
+                    print(json.dumps({"ok": True, "skipped": "locked", "attempted": attempted}))
+                    return 0
+                current = _read_task(name[:-5], sess)
+                current["attachments"] = record["attachments"]
+                current["references"] = record.get("references", [])
+                for item in current.get("item_messages") or []:
+                    indexes = {a.get("index") for a in item.get("attachments") or []}
+                    item["attachments"] = [a for a in current.get("attachments") or []
+                                           if a.get("index") in indexes]
+                atomic_write_json(path, current)
+                record_health(sess, "media", success=all(p.get("ok") for p in attachment_parts(current)),
+                              error="attachments_unavailable" if any(not p.get("ok") for p in attachment_parts(current)) else None)
+    _refresh_reference_snapshots(sess)
+    print(json.dumps({"ok": True, "attempted": attempted, "recovered": recovered}))
+    return 0
+
+
 def cmd_poll(args):
     ensure_dirs()
-    with Locked() as ok:
+    with Locked("poll.lock") as ok:
         if not ok:
             print(json.dumps({"ok": True, "skipped": "locked"}, ensure_ascii=False))
             return 0
@@ -627,7 +817,12 @@ def cmd_poll(args):
 
 
 def _poll_locked(args):
-    sess = load_session()
+    with Locked() as ok:
+        if not ok:
+            print(json.dumps({"ok": True, "skipped": "locked"}))
+            return 0
+        sess = load_session()
+        cursor = load_cursor()
     if not valid_session(sess):
         print(json.dumps({"ok": False, "error": "NO_SESSION"}, ensure_ascii=False))
         return 0
@@ -637,12 +832,14 @@ def _poll_locked(args):
     base = sess.get("baseurl") or DEFAULT_BASE
     token = sess["bot_token"]
     batch = time.strftime("%Y%m%dT%H%M%S")
+    record_health(sess, "poll", attempt=True)
     resp, err = http_post(
         base, "/ilink/bot/getupdates",
-        {"get_updates_buf": load_cursor(), "base_info": base_info()},
+        {"get_updates_buf": cursor, "base_info": base_info()},
         bot_token=token, timeout=POLL_HTTP_TIMEOUT)
     touch_tick()
     if err:
+        record_health(sess, "poll", error=err)
         if err in ("http_401", "http_403"):
             print(json.dumps({"ok": False, "error": "NEED_LOGIN"},
                              ensure_ascii=False))
@@ -652,6 +849,7 @@ def _poll_locked(args):
         return 0
     ret = resp.get("ret")
     if ret == -14 or resp.get("errcode") == -14:
+        record_health(sess, "poll", error="PAUSED_1H")
         # documented: pause the account session for one hour
         set_pause(3600)
         log("getupdates ret -14: pausing 1h per protocol doc")
@@ -660,10 +858,53 @@ def _poll_locked(args):
     errcode = resp.get("errcode")
     if ret not in (0, None) or errcode not in (0, None):
         code = ret if ret not in (0, None) else errcode
+        record_health(sess, "poll", error="business_code_%s" % code)
         log("getupdates business error: code=%s" % code)
         print(json.dumps({"ok": False, "error": "business_code_%s" % code},
                          ensure_ascii=False))
         return 0
+    prepared = {}
+    for message in resp.get("msgs", []) or []:
+        if (message.get("message_type") != 1 or message.get("group_id")
+                or not belongs_to_session(message, sess, inbound=True)):
+            continue
+        key = _inbound_key(message, sess)
+        if os.path.exists(os.path.join(INBOX, key + ".json")):
+            continue
+        directory = os.path.join(ROOT, "media", time.strftime("%Y-%m-%d"))
+        prepared[key] = (
+            media_mod.download_message_attachments(sess, message, directory, key),
+            extract_references(message, sess, directory, key))
+    with Locked() as ok:
+        if not ok:
+            print(json.dumps({"ok": True, "skipped": "locked"}))
+            return 0  # cursor stays unchanged; staged downloads are safe to repeat
+        current = load_session()
+        if current != sess or load_cursor() != cursor:
+            print(json.dumps({"ok": False, "error": "poll_snapshot_changed"}))
+            return 1
+        try:
+            result = _persist_poll(sess, resp, batch, prepared)
+        except Exception as error:
+            record_health(sess, "poll", error=type(error).__name__)
+            raise
+        record_health(sess, "poll", success=True)
+        return result
+
+
+def _inbound_key(message, sess):
+    key = "%s_%s" % (message.get("seq"), message.get("message_id"))
+    outbox_path(key)
+    path = os.path.join(INBOX, key + ".json")
+    if os.path.exists(path):
+        with open(path, encoding="utf-8") as stream:
+            previous = json.load(stream)
+        if not belongs_to_session(previous, sess, inbound=True):
+            key = account_id(sess)[:16] + "_" + key
+    return key
+
+
+def _persist_poll(sess, resp, batch, prepared):
     buf = resp.get("get_updates_buf")
     added = 0
     for m in resp.get("msgs", []) or []:
@@ -683,8 +924,7 @@ def _poll_locked(args):
                 previous = json.load(f)
             if belongs_to_session(previous, sess, inbound=True):
                 if not previous.get("delayed_flushed", True):
-                    _flush_delayed(m.get("from_user_id"), m.get("context_token"))
-                    previous["delayed_flushed"] = True
+                    previous["delayed_flushed"] = _flush_delayed(m.get("from_user_id"), m.get("context_token"))
                     atomic_write_json(ipath, previous)
                 continue  # dedup
             # Different accounts can reuse sequence/message IDs; retain the old record.
@@ -694,8 +934,7 @@ def _poll_locked(args):
                 with open(ipath, encoding="utf-8") as f:
                     previous = json.load(f)
                 if not previous.get("delayed_flushed", True):
-                    _flush_delayed(m.get("from_user_id"), m.get("context_token"))
-                    previous["delayed_flushed"] = True
+                    previous["delayed_flushed"] = _flush_delayed(m.get("from_user_id"), m.get("context_token"))
                     atomic_write_json(ipath, previous)
                 continue
         text, has_media = extract_text_and_media(m)
@@ -718,8 +957,8 @@ def _poll_locked(args):
             "attachments": [],
             "delayed_flushed": False,
         }
-        directory = os.path.join(ROOT, "media", time.strftime("%Y-%m-%d"))
-        rec["attachments"] = media_mod.download_message_attachments(sess, m, directory, key)
+        rec["attachments"], rec["references"] = prepared[key]
+        _resolve_staged_references(rec["references"], sess)
         rec["item_messages"] = []
         for index, item in enumerate(m.get("item_list") or []):
             item_id = server_message_id(item.get("msg_id")) if isinstance(item, dict) else None
@@ -728,7 +967,6 @@ def _poll_locked(args):
                 rec["item_messages"].append({
                     "msg_id": item_id, "text": item_text, "has_media": item_has_media,
                     "attachments": [a for a in rec["attachments"] if a.get("index") == index]})
-        rec["references"] = extract_references(m, sess, directory, key)
         atomic_write_json(ipath, rec)
         added += 1
         log_history(
@@ -741,14 +979,23 @@ def _poll_locked(args):
         log("inbox new %s media=%s text_len=%d attachments=%d"
             % (key, has_media, len(text), len(rec["attachments"])))
         # flush delayed queue: retry first queued reply with fresh context
-        _flush_delayed(m.get("from_user_id"), m.get("context_token"))
-        rec["delayed_flushed"] = True
+        rec["delayed_flushed"] = _flush_delayed(m.get("from_user_id"), m.get("context_token"))
         atomic_write_json(ipath, rec)
     # A replay after a crash is safe because inbox writes are atomic and deduplicated.
     if buf:
         save_cursor(buf)
     print(json.dumps({"ok": True, "new": added}, ensure_ascii=False))
     return 0
+
+
+def _resolve_staged_references(references, sess):
+    """Earlier messages in this same page are now durable and can resolve ID-only quotes."""
+    for reference in references:
+        if reference.get("resolution") == "missing" and reference.get("reference_id"):
+            cached = find_cached_reference(reference["reference_id"], sess)
+            if cached and (cached["text"] or cached["has_media"]):
+                reference.update(cached, content_available=True, resolution="local_history")
+        _resolve_staged_references(reference.get("references") or [], sess)
 
 
 def delayed_path():
@@ -777,6 +1024,14 @@ def _to_delayed(o):
 
 
 def _flush_delayed(user_id, fresh_context_token):
+    with Locked("send.lock") as ok:
+        if not ok:
+            return False
+        _flush_delayed_locked(user_id, fresh_context_token)
+        return True
+
+
+def _flush_delayed_locked(user_id, fresh_context_token):
     if not user_id:
         return
     d = load_delayed()
@@ -794,19 +1049,23 @@ def _flush_delayed(user_id, fresh_context_token):
     entry["status"] = "pending"
     entry["attempts"] = 0
     entry["last_error"] = ""
+    entry["error_kind"] = None
+    entry["next_attempt_at"] = 0
     path = outbox_path(entry["reply_to"])
     if os.path.exists(path):
         with open(path, encoding="utf-8") as f:
             existing = json.load(f)
         # Recovery after a crash between writing outbox and removing delayed entry.
-        if (existing.get("status") != "delayed"
-                and not (existing.get("status") == "pending" and existing.get("attempts", 0) >= 3)):
+        interrupted_move = (existing.get("status") == "pending" and (
+            existing.get("error_kind") == "context" or
+            (existing.get("attempts", 0) >= 3 and existing.get("error_kind") in (None, "business_unknown"))))
+        if existing.get("status") != "delayed" and not interrupted_move:
             save_delayed(d)
             return
         # The outbox copy can have newer progress than an interrupted queue move.
         entry = existing
         entry.update(context_token=fresh_context_token or entry.get("context_token"),
-                     status="pending", attempts=0, last_error="")
+                     status="pending", attempts=0, last_error="", error_kind=None, next_attempt_at=0)
     _write_outbox(path, entry)
     save_delayed(d)
     log("flushed 1 delayed reply for user ...%s" % user_id[-8:])
@@ -816,7 +1075,7 @@ def _flush_delayed(user_id, fresh_context_token):
 
 def cmd_send(args):
     ensure_dirs()
-    with Locked() as ok:
+    with Locked("send.lock") as ok:
         if not ok:
             print(json.dumps({"ok": True, "skipped": "locked"}, ensure_ascii=False))
             return 0
@@ -824,7 +1083,13 @@ def cmd_send(args):
 
 
 def _send_locked(args):
-    sess = load_session()
+    with Locked() as ok:
+        if not ok:
+            print(json.dumps({"ok": True, "skipped": "locked"}))
+            return 0
+        sess = load_session()
+        if valid_session(sess):
+            _resume_delayed_flushes(sess)
     if not valid_session(sess):
         print(json.dumps({"ok": False, "error": "NO_SESSION"}, ensure_ascii=False))
         return 0
@@ -852,12 +1117,15 @@ def _send_locked(args):
         if not belongs_to_session(o, sess):
             log("skip outbox from another account: %s" % fn)
             continue
-        if o.get("attempts", 0) >= 3:
+        o.setdefault("created_at", os.path.getmtime(p))
+        if o.get("attempts", 0) >= 3 and not o.get("error_kind"):
             # Keep both copies until the queue move is durable; retries deduplicate.
             _to_delayed(o)
             o["status"] = "delayed"
             _write_outbox(p, o)
             failed += 1
+            continue
+        if o.get("next_attempt_at", 0) > time.time():
             continue
         if "delivery" not in o:
             o["delivery"] = []
@@ -874,6 +1142,8 @@ def _send_locked(args):
             _write_outbox(p, o)
 
         def _do_send():
+            if not o.get("context_token"):
+                raise DeliveryError("context", "NO_CONTEXT_TOKEN")
             cached_voice = any(item.get("type") == 3 for part in o["delivery"]
                                for item in part.get("item_list") or [])
             if (o.get("media") or {}).get("kind") == "voice" or cached_voice:
@@ -916,7 +1186,7 @@ def _send_locked(args):
                 resp, err = http_post(base, "/ilink/bot/sendmessage", body,
                                       bot_token=token, timeout=30)
                 if err:
-                    raise RuntimeError("net: " + err)
+                    raise transport_error(err)
                 # Per protocol doc: only non-zero ret is a failure;
                 # missing ret is NOT a failure (server returns message_id).
                 ret = (resp or {}).get("ret")
@@ -924,7 +1194,7 @@ def _send_locked(args):
                     set_pause(3600)
                     raise RuntimeError("PAUSED_1H")
                 if ret not in (None, 0):
-                    raise RuntimeError("business: ret=%s" % ret)
+                    raise DeliveryError("business_unknown", "send_ret_%s" % ret)
                 response_id = server_message_id((resp or {}).get("message_id"))
                 if response_id:
                     part["message_id"] = response_id
@@ -932,6 +1202,7 @@ def _send_locked(args):
                 _write_outbox(p, o)
 
         try:
+            record_health(sess, "send", attempt=True)
             if use_typing:
                 with media_mod.Typing(http_post, sess, o["to_user_id"],
                                       o.get("context_token")):
@@ -940,18 +1211,39 @@ def _send_locked(args):
                 _do_send()
         except Exception as e:
             paused = time.time() < pause_until()
+            kind, code = classify(e)
+            if paused:
+                kind, code = "paused", "PAUSED_1H"
             if not paused:
                 o["attempts"] = o.get("attempts", 0) + 1
-            o["last_error"] = str(e)[:200]
+            o["last_error"] = code
+            o["error_kind"] = kind
+            o["last_attempt_at"] = time.time()
+            o["next_attempt_at"] = (pause_until() if paused else
+                                     time.time() + retry_delay(o["attempts"]))
+            if kind in ("permanent", "local_io") or (kind == "transient" and o["attempts"] >= 8):
+                o["status"] = "failed"
+            elif kind == "auth":
+                o["status"] = "blocked"
+            elif kind == "context" or (kind == "business_unknown" and o["attempts"] >= 3):
+                # Keep the durable pending copy if the delayed queue write fails.
+                _write_outbox(p, o)
+                _to_delayed(o)
+                o["status"] = "delayed"
             _write_outbox(p, o)
-            log("send fail %s: %s" % (fn, e))
+            record_health(sess, "send", error=code)
+            log("send fail %s: %s %s" % (fn, kind, code))
             failed += 1
-            if paused:
+            if paused or kind == "auth":
                 break
             continue
         o["status"] = "sent"
         o["last_error"] = ""
+        o["error_kind"] = None
+        o["next_attempt_at"] = 0
+        o["sent_at"] = time.time()
         _write_outbox(p, o)
+        record_health(sess, "send", success=True)
         sent += 1
         log("sent %s" % fn)
         log_history(
@@ -971,26 +1263,88 @@ def _write_outbox(path, obj):
     atomic_write_json(path, obj)
 
 
+def cmd_retry_send(args):
+    with Locked("send.lock") as acquired:
+        if not acquired:
+            print(json.dumps({"ok": True, "skipped": "locked"}))
+            return 0
+        with Locked() as acquired:
+            if not acquired:
+                print(json.dumps({"ok": True, "skipped": "locked"}))
+                return 0
+            sess = load_session()
+            path = outbox_path(args.key)
+            with open(path, encoding="utf-8") as stream:
+                rec = json.load(stream)
+            if not belongs_to_session(rec, sess) or rec.get("status") == "sent":
+                raise ValueError("reply is not retryable in this account")
+            latest = _latest_inbound(sess)
+            if latest and latest.get("context_token"):
+                rec["context_token"] = latest["context_token"]
+            rec.update(status="pending", attempts=0, next_attempt_at=0, error_kind=None, last_error="")
+            _write_outbox(path, rec)
+            # Durable pending copy first; _flush_delayed also recovers interrupted removal.
+            delayed = load_delayed()
+            for user in list(delayed):
+                delayed[user] = [item for item in delayed[user]
+                                 if not (item.get("reply_to") == args.key and belongs_to_session(item, sess))]
+                if not delayed[user]:
+                    del delayed[user]
+            save_delayed(delayed)
+    print(json.dumps({"ok": True, "queued": args.key}))
+    return 0
+
+
+def _resume_delayed_flushes(sess):
+    """Recover arrivals deferred while send held its transport lock."""
+    for name in sorted(os.listdir(INBOX)):
+        if not name.endswith(".json"):
+            continue
+        path = os.path.join(INBOX, name)
+        try:
+            rec = _load_inbox_record(path)
+        except (OSError, ValueError):
+            log("invalid inbox record retained: %s" % name)
+            continue
+        if belongs_to_session(rec, sess, inbound=True) and rec.get("delayed_flushed") is False:
+            _flush_delayed_locked(rec["from_user_id"], rec.get("context_token"))
+            rec["delayed_flushed"] = True
+            atomic_write_json(path, rec)
+
+
 def outbox_path(key):
     if not isinstance(key, str) or not key or any(c in key for c in '/\\\x00:') or key in (".", ".."):
         raise ValueError("invalid message key")
     return os.path.join(OUTBOX, key + ".json")
 
 
-def queue_reply(reply_to, to_user_id, context_token, text, media=None):
+def queue_reply(reply_to, to_user_id, context_token, text, media=None,
+                task_key=None, claim_token=None):
     """Queue image/file/video or audio. The voice alias always sends playable FILE media."""
     with Locked() as ok:
         if not ok:
             raise RuntimeError("bridge busy; retry queue_reply later")
-        return _queue_reply_locked(reply_to, to_user_id, context_token, text, media)
+        return _queue_reply_locked(reply_to, to_user_id, context_token, text, media,
+                                   task_key, claim_token)
 
 
-def _queue_reply_locked(reply_to, to_user_id, context_token, text, media=None):
+def _queue_reply_locked(reply_to, to_user_id, context_token, text, media=None,
+                        task_key=None, claim_token=None):
     sess = load_session()
     if not valid_session(sess) or to_user_id != sess["ilink_user_id"]:
         raise ValueError("reply recipient is not the bound user")
+    linked = task_key or reply_to
+    outbox_path(linked)
+    task_path = os.path.join(INBOX, linked + ".json")
+    if task_key or os.path.exists(task_path):
+        rec = _read_task(linked, sess)
+        _check_claim(rec, claim_token)
     p = outbox_path(reply_to)
     if os.path.exists(p):
+        with open(p, encoding="utf-8") as stream:
+            existing = json.load(stream)
+        if not belongs_to_session(existing, sess):
+            raise ValueError("reply key belongs to another account")
         return p  # already queued/sent; never duplicate
     if media is not None:
         media_mod.validate_media_spec(media, check_file=True)
@@ -1004,11 +1358,90 @@ def _queue_reply_locked(reply_to, to_user_id, context_token, text, media=None):
         "status": "pending",
         "attempts": 0,
         "last_error": "",
+        "created_at": time.time(),
     })
     return p
 
 
 # ---------- mark / status / serve ----------
+
+def _read_task(key, sess):
+    outbox_path(key)
+    rec = _load_inbox_record(os.path.join(INBOX, key + ".json"))
+    if not belongs_to_session(rec, sess, inbound=True):
+        raise ValueError("task belongs to another account")
+    return rec
+
+
+def _check_claim(rec, token):
+    lease = rec.get("lease") or {}
+    if (rec.get("status") != "processing" or not token
+            or lease.get("token") != token or lease.get("expires_at", 0) <= time.time()):
+        raise ValueError("claim missing, expired or owned by another worker")
+
+
+def claim_task(key, worker, lease_seconds=300):
+    """Atomically claim a new task or recover an expired, fenced lease."""
+    if not isinstance(worker, str) or not worker.strip() or not 1 <= lease_seconds <= 86400:
+        raise ValueError("worker and lease duration (1..86400 seconds) required")
+    with Locked() as ok:
+        if not ok:
+            raise RuntimeError("bridge busy; retry claim later")
+        rec = _read_task(key, load_session())
+        lease = rec.get("lease") or {}
+        recovered = (rec.get("status") == "processing" and bool(lease)
+                     and lease.get("expires_at", 0) <= time.time())
+        if rec.get("status") != "new" and not recovered:
+            raise ValueError("task is not available")
+        now = time.time()
+        rec.update(status="processing", lease={"worker": worker, "token": uuid.uuid4().hex,
+                   "claimed_at": now, "expires_at": now + lease_seconds}, updated_at=now)
+        atomic_write_json(os.path.join(INBOX, key + ".json"), rec)
+        return {"ok": True, "key": key, "claim_token": rec["lease"]["token"],
+                "expires_at": rec["lease"]["expires_at"], "recovered": recovered}
+
+
+def renew_task(key, claim_token, lease_seconds=300):
+    if not 1 <= lease_seconds <= 86400:
+        raise ValueError("lease duration must be 1..86400 seconds")
+    with Locked() as ok:
+        if not ok:
+            raise RuntimeError("bridge busy; retry renewal later")
+        rec = _read_task(key, load_session())
+        _check_claim(rec, claim_token)
+        rec["lease"]["expires_at"] = time.time() + lease_seconds
+        rec["updated_at"] = time.time()
+        atomic_write_json(os.path.join(INBOX, key + ".json"), rec)
+        return {"ok": True, "expires_at": rec["lease"]["expires_at"]}
+
+
+def cmd_claim(args):
+    print(json.dumps(claim_task(args.key, args.worker, args.lease_seconds)))
+    return 0
+
+
+def cmd_renew(args):
+    print(json.dumps(renew_task(args.key, args.claim_token, args.lease_seconds)))
+    return 0
+
+
+@serialized
+def cmd_reset_task(args):
+    """Explicit operator recovery; never reopens processing or completed work."""
+    if not args.reason.strip():
+        raise ValueError("a recovery reason is required")
+    rec = _read_task(args.key, load_session())
+    if rec.get("status") != "failed":
+        raise ValueError("only failed tasks can be reset")
+    rec.update(status="new", updated_at=time.time(),
+               reset={"at": time.time(), "reason": args.reason,
+                      "count": (rec.get("reset") or {}).get("count", 0) + 1})
+    rec.pop("lease", None)
+    # Keep last_claim_token: old workers remain fenced until a fresh claim.
+    atomic_write_json(os.path.join(INBOX, args.key + ".json"), rec)
+    print(json.dumps({"ok": True, "key": args.key, "status": "new"}))
+    return 0
+
 
 @serialized
 def cmd_mark(args):
@@ -1018,9 +1451,16 @@ def cmd_mark(args):
     if not os.path.exists(p):
         print(json.dumps({"ok": False, "error": "not_found"}, ensure_ascii=False))
         return 1
-    with open(p, encoding="utf-8") as f:
-        rec = json.load(f)
+    rec = _read_task(args.key, load_session())
+    if args.status == "processing":
+        raise ValueError("use claim --worker to enter processing")
+    if rec.get("lease") or rec.get("last_claim_token"):
+        _check_claim(rec, getattr(args, "claim_token", None))
     rec["status"] = args.status
+    if rec.get("lease"):
+        rec["last_claim_token"] = rec["lease"]["token"]
+    rec.pop("lease", None)
+    rec["updated_at"] = time.time()
     if args.note:
         rec["note"] = args.note
     atomic_write_json(p, rec)
@@ -1042,33 +1482,88 @@ def redact(sess):
 def cmd_status(args):
     ensure_dirs()
     sess = load_session()
-    inbox = [f for f in os.listdir(INBOX) if f.endswith(".json")] if os.path.isdir(INBOX) else []
-    outbox = [f for f in os.listdir(OUTBOX) if f.endswith(".json")] if os.path.isdir(OUTBOX) else []
-    by_status = {}
-    for fn in inbox:
-        try:
-            with open(os.path.join(INBOX, fn), encoding="utf-8") as f:
-                st = json.load(f).get("status", "?")
-            by_status[st] = by_status.get(st, 0) + 1
-        except Exception:
-            pass
-    pending_out = 0
-    for fn in outbox:
-        try:
-            with open(os.path.join(OUTBOX, fn), encoding="utf-8") as f:
-                if json.load(f).get("status") == "pending":
-                    pending_out += 1
-        except Exception:
-            pass
+    now = time.time()
+    invalid = {"inbox": 0, "outbox": 0}
+
+    def records(directory, inbound):
+        found = []
+        for name in os.listdir(directory):
+            if not name.endswith(".json"):
+                continue
+            try:
+                path = os.path.join(directory, name)
+                if inbound:
+                    record = _load_inbox_record(path)
+                else:
+                    with open(path, encoding="utf-8") as stream:
+                        record = json.load(stream)
+                if not isinstance(record, dict):
+                    raise ValueError("invalid record")
+                if belongs_to_session(record, sess, inbound=inbound):
+                    record.setdefault("created_at", os.path.getmtime(path))
+                    found.append(record)
+            except (OSError, ValueError, TypeError):
+                invalid["inbox" if inbound else "outbox"] += 1
+        return found
+
+    inbox, outbox = records(INBOX, True), records(OUTBOX, False)
+    by_status, out_status = {}, {}
+    expired = legacy = media_pending = media_exhausted = 0
+    for record in inbox:
+        state = record.get("status", "?")
+        by_status[state] = by_status.get(state, 0) + 1
+        if state == "processing":
+            lease = record.get("lease") or {}
+            expired += int(bool(lease) and lease.get("expires_at", 0) <= now)
+            legacy += int(not lease)
+        for part in attachment_parts(record):
+            retry = part.get("retry") or {}
+            if not part.get("ok") and retry:
+                media_pending += int(not retry.get("stopped") and retry.get("attempts", 0) < 5)
+                media_exhausted += int(bool(retry.get("stopped")) or retry.get("attempts", 0) >= 5)
+    delayed_keys = set()
+    for record in outbox:
+        state = record.get("status", "?")
+        out_status[state] = out_status.get(state, 0) + 1
+        if state == "delayed":
+            delayed_keys.add(record["reply_to"])
+    delayed_error = None
+    try:
+        for queue in load_delayed().values():
+            for record in queue:
+                if belongs_to_session(record, sess):
+                    # Ignore stale queue copies after a successful durable transition.
+                    current = next((o for o in outbox if o.get("reply_to") == record.get("reply_to")), None)
+                    if current is None or current.get("status") == "delayed":
+                        delayed_keys.add(record["reply_to"])
+    except (OSError, ValueError, TypeError, AttributeError, KeyError):
+        delayed_error = "invalid_delayed_queue"
+    pending = [o for o in outbox if o.get("status") == "pending"]
+    health = {operation: read_health(sess, operation) for operation in ("poll", "send", "media")}
     lt = os.path.join(STATE, "last_tick.txt")
-    last_tick = open(lt).read().strip() if os.path.exists(lt) else None
+    last_tick = None
+    if os.path.exists(lt):
+        with open(lt, encoding="utf-8") as stream:
+            last_tick = stream.read().strip()
     print(json.dumps({
         "ok": True,
-        "logged_in": bool(sess and sess.get("bot_token")),
+        "logged_in": valid_session(sess),
+        "needs_login": not valid_session(sess) or any(h.get("last_error") in ("http_401", "http_403")
+                                                       for h in health.values()),
         "session": redact(sess),
-        "paused": time.time() < pause_until(),
-        "inbox": {"total": len(inbox), "by_status": by_status},
-        "outbox_pending": pending_out,
+        "paused": now < pause_until(),
+        "inbox": {"total": len(inbox), "by_status": by_status,
+                  "expired_leases": expired, "legacy_processing": legacy},
+        "outbox_pending": len(pending),
+        "outbox": {"total": len(outbox), "by_status": out_status,
+                   "ready": sum(o.get("next_attempt_at", 0) <= now for o in pending),
+                   "waiting_retry": sum(o.get("next_attempt_at", 0) > now for o in pending),
+                   "delayed": len(delayed_keys),
+                   "oldest_pending_age_seconds": max([max(0, now - o["created_at"]) for o in pending], default=0)},
+        "media": {"pending_retry": media_pending, "exhausted": media_exhausted},
+        "health": health,
+        "invalid_records": invalid,
+        "delayed_queue_error": delayed_error,
         "last_tick": last_tick,
         "cursor_saved": bool(load_cursor()),
     }, ensure_ascii=False, indent=2))
@@ -1137,6 +1632,7 @@ def cmd_send_media(args):
         "status": "pending",
         "attempts": 0,
         "last_error": "",
+        "created_at": time.time(),
     })
     print(json.dumps({"ok": True, "queued": key}, ensure_ascii=False))
     return 0
@@ -1185,6 +1681,7 @@ def cmd_send_proactive(args):
     return 0
 
 
+@transport_exclusive
 @serialized
 def cmd_cleanup(args):
     ensure_dirs()
@@ -1214,7 +1711,7 @@ def cmd_cleanup(args):
         try:
             with open(os.path.join(INBOX, name), encoding="utf-8") as stream:
                 entry = json.load(stream)
-            if entry.get("status") not in ("done", "failed"):
+            if entry.get("status") not in ("done", "failed") or media_retry_pending(entry):
                 retained_media.update(inbox_media_paths(entry))
         except (OSError, ValueError, KeyError, TypeError, AttributeError):
             print(json.dumps({"ok": False, "error": "invalid_inbox_record"}))
@@ -1235,7 +1732,8 @@ def cmd_cleanup(args):
                                 continue  # never delete an undelivered reply
                     if d == INBOX and fn.endswith(".json"):
                         with open(p, encoding="utf-8") as f:
-                            if json.load(f).get("status") not in ("done", "failed"):
+                            record = json.load(f)
+                            if record.get("status") not in ("done", "failed") or media_retry_pending(record):
                                 continue
                     if os.path.getmtime(p) < cutoff:
                         os.remove(p)
@@ -1263,6 +1761,7 @@ def cmd_serve(args):
     try:
         while True:
             cmd_poll(args)
+            cmd_retry_media(args)
             cmd_send(args)
             time.sleep(args.every)
     except KeyboardInterrupt:
@@ -1281,6 +1780,10 @@ def main():
     w.add_argument("--verify-code", default=None)
 
     p = sub.add_parser("poll")
+    retry_media = sub.add_parser("retry-media", help="retry failed attachments using protected sources")
+    retry_media.add_argument("--limit", type=int, default=20)
+    retry_send = sub.add_parser("retry-send", help="requeue a failed reply, preserving delivery IDs")
+    retry_send.add_argument("key")
 
     s = sub.add_parser("send")
     s.add_argument("--typing", action="store_true",
@@ -1317,8 +1820,21 @@ def main():
 
     m = sub.add_parser("mark")
     m.add_argument("key")
-    m.add_argument("status", choices=["new", "processing", "done", "failed"])
+    m.add_argument("status", choices=["new", "done", "failed"])
     m.add_argument("--note", default="")
+    m.add_argument("--claim-token")
+
+    claim = sub.add_parser("claim", help="atomically claim a new or expired task")
+    claim.add_argument("key")
+    claim.add_argument("--worker", required=True)
+    claim.add_argument("--lease-seconds", type=int, default=300)
+    reset = sub.add_parser("reset-task", help="explicitly reopen a failed task after checking external effects")
+    reset.add_argument("key")
+    reset.add_argument("--reason", required=True)
+    renew = sub.add_parser("renew", help="renew a live task lease")
+    renew.add_argument("key")
+    renew.add_argument("--claim-token", required=True)
+    renew.add_argument("--lease-seconds", type=int, default=300)
 
     sv = sub.add_parser("serve")
     sv.add_argument("--every", type=int, default=60)
@@ -1333,6 +1849,10 @@ def main():
         return cmd_wait_login(args)
     if args.cmd == "poll":
         return cmd_poll(args)
+    if args.cmd == "retry-media":
+        return cmd_retry_media(args)
+    if args.cmd == "retry-send":
+        return cmd_retry_send(args)
     if args.cmd == "send":
         return cmd_send(args)
     if args.cmd == "send-file":
@@ -1350,6 +1870,12 @@ def main():
         return cmd_send_proactive(args)
     if args.cmd == "mark":
         return cmd_mark(args)
+    if args.cmd == "claim":
+        return cmd_claim(args)
+    if args.cmd == "reset-task":
+        return cmd_reset_task(args)
+    if args.cmd == "renew":
+        return cmd_renew(args)
     if args.cmd == "serve":
         return cmd_serve(args)
     if args.cmd == "status":
@@ -1363,4 +1889,7 @@ if __name__ == "__main__":
     except session_store.SessionEncryptionError as error:
         print(json.dumps({"ok": False, "error": "SESSION_ENCRYPTION_ERROR",
                           "hint": str(error)}, ensure_ascii=False))
+        sys.exit(1)
+    except (ValueError, RuntimeError) as error:
+        print(json.dumps({"ok": False, "error": str(error)}, ensure_ascii=False))
         sys.exit(1)
